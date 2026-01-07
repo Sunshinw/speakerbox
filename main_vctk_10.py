@@ -14,67 +14,56 @@ from transformers import (
     EvalPrediction,
 )
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ==========================================
-# ⚙️ CONFIGURATION
-# ==========================================
-VCTK_ROOT = r"C:\Users\sunshine\Desktop\DS_10283_3443\VCTK-Corpus-0.92\wav48_silence_trimmed"
+# VCTK_ROOT = r"C:\Users\sunshine\Desktop\DS_10283_3443\VCTK-Corpus-0.92\wav48_silence_trimmed"
+VCTK_ROOT = ""
 OUTPUT_MODEL_DIR = "vctk_fast_model"
 
-# Performance Config
-BATCH_SIZE = 8          # Higher batch size because we pre-process!
+BATCH_SIZE = 8
 NUM_EPOCHS = 5
 LEARNING_RATE = 3e-5
-MAX_DURATION = 2.0      # Seconds
-SUBSET_PERCENTAGE = 0.1 # Use 10% of data (approx 8,000 samples instead of 88,000)
-# ==========================================
+MAX_DURATION = 2.0
+SUBSET_PERCENTAGE = 0.1
 
 def prepare_vctk_subset(root_path: str) -> pd.DataFrame:
     root = Path(root_path)
-    log.info(f"📂 Scanning VCTK files in: {root}")
+    log.info(f"Scanning VCTK files in: {root}")
     
     data = []
     audio_files = list(root.glob("**/*.flac"))
     
     if not audio_files:
-        raise ValueError("❌ No .flac files found!")
+        raise ValueError("No .flac files found!")
 
     for filepath in audio_files:
         parts = filepath.name.split("_")
         if len(parts) >= 2:
             data.append({
                 "audio": str(filepath.resolve()), 
-                "label": parts[0],             # p225
-                "conversation_id": parts[1],   # 001
+                "label": parts[0],
+                "conversation_id": parts[1],
             })
             
     df = pd.DataFrame(data)
     
-    # --- 1. Filter Speakers ---
-    # Remove speakers with too little data
     counts = df.groupby("label")["conversation_id"].nunique()
     valid_speakers = counts[counts >= 10].index
     df = df[df.label.isin(valid_speakers)]
     
-    # --- 2. Stratified Subsampling ---
-    # We want 10% of data, but we MUST keep all speakers balanced
-    log.info(f"✂️  Subsampling to {SUBSET_PERCENTAGE*100}% of data...")
+    log.info(f"Subsampling to {SUBSET_PERCENTAGE*100}% of data...")
     
-    # Group by speaker and sample 10% from each
     df_subset = df.groupby("label", group_keys=False).apply(
         lambda x: x.sample(frac=SUBSET_PERCENTAGE, random_state=42)
     )
     
-    log.info(f"✅ Subset Ready: {len(df_subset)} samples (was {len(df)})")
-    log.info(f"   Speakers: {df_subset.label.nunique()} (All speakers preserved)")
+    log.info(f"Subset Ready: {len(df_subset)} samples (was {len(df)})")
+    log.info(f"Speakers: {df_subset.label.nunique()}")
     
     return df_subset
 
 def create_split(df: pd.DataFrame) -> DatasetDict:
-    # Standard stratified split
     train_ids, test_valid_ids = train_test_split(df.conversation_id.unique(), test_size=0.2, random_state=42)
     test_ids, valid_ids = train_test_split(test_valid_ids, test_size=0.5, random_state=42)
 
@@ -89,17 +78,14 @@ def create_split(df: pd.DataFrame) -> DatasetDict:
     })
 
 def main():
-    # 1. Prepare Data
     df = prepare_vctk_subset(VCTK_ROOT)
     dataset = create_split(df)
     
-    # 2. Encode Labels
     dataset = dataset.class_encode_column("label")
     label2id = {l: i for i, l in enumerate(dataset["train"].features["label"].names)}
     id2label = {str(i): l for l, i in label2id.items()}
     num_labels = len(label2id)
 
-    # 3. Pre-process into RAM (The Fast Way)
     base_model = "superb/wav2vec2-base-superb-sid"
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(base_model)
     dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
@@ -116,19 +102,17 @@ def main():
         )
         return inputs
 
-    log.info("⚙️  Pre-processing audio (Extracting features into RAM)...")
-    # This might take 5-10 mins, but training will be instant afterwards
+    log.info("Pre-processing audio...")
     encoded_dataset = dataset.map(
         preprocess_function, 
         batched=True, 
-        batch_size=100, # Safe batch size for 10% data
+        batch_size=100,
         remove_columns=["audio"]
     )
     
     encoded_dataset.set_format(type="torch", columns=["input_values", "label"])
     encoded_dataset = encoded_dataset.rename_column("label", "labels")
 
-    # 4. Model
     model = Wav2Vec2ForSequenceClassification.from_pretrained(
         base_model,
         num_labels=num_labels,
@@ -137,19 +121,15 @@ def main():
         ignore_mismatched_sizes=True,
     )
 
-    # 5. Metrics
     metric = load_metric("accuracy", trust_remote_code=True)
     def compute_metrics(eval_pred: EvalPrediction):
-        # FIX: Check if predictions is a tuple (logits, hidden_states)
         logits = eval_pred.predictions
         if isinstance(logits, tuple):
             logits = logits[0]
             
-        # Now we can safely use argmax on the logits
         predictions = np.argmax(logits, axis=-1)
         return metric.compute(predictions=predictions, references=eval_pred.label_ids)
 
-    # 6. Training Config
     use_fp16 = torch.cuda.is_available()
     
     args = TrainingArguments(
@@ -178,15 +158,14 @@ def main():
     )
 
     print("\n" + "="*50)
-    print(f"🚀 STARTING FAST TRAINING (10% Data Subset)")
-    print(f"   Speakers: {num_labels}")
-    print(f"   Train Samples: {len(encoded_dataset['train'])}")
+    print(f"STARTING FAST TRAINING (10% Data Subset)")
+    print(f"Speakers: {num_labels}")
+    print(f"Train Samples: {len(encoded_dataset['train'])}")
     print("="*50)
     
     trainer.train()
 
-    # Final Eval
-    print("📊 Evaluating...")
+    print("Evaluating...")
     metrics = trainer.evaluate(encoded_dataset["test"])
     print(metrics)
     
