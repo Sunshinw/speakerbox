@@ -1,9 +1,12 @@
 # speakerbox
 --------------------------------------------------------------
 # Tang's reimplementation
-To run the original model, install the dependency `pip install speakerbox` with perferable virtual environment (conda or venv).
-Then run `python .\main_github.py` in ternimal
+To run the original model, install the dependency `pip install speakerbox` with perferable virtual environment (conda or venv). <br>
+Then run `python .\main_github.py` in ternimal. <br>
 
+# VCTK dataset recreation (Change on preprocess and code structure)
+For using a small subset of speakers (faster, low resource required), run `python .\main_vctk_10.py` in ternimal. <br>
+For using all of speakers in vctk (much slower, very high resource required), run `python .\main_vctk_100.py` in ternimal. <br>
 
 --------------------------------------------------------------
 [![Build Status](https://github.com/CouncilDataProject/speakerbox/workflows/CI/badge.svg)](https://github.com/CouncilDataProject/speakerbox/actions)
