@@ -5,6 +5,9 @@ To run the original model, install the dependency `pip install speakerbox` with 
 Then run `python .\main_github.py` in ternimal. <br>
 
 # VCTK dataset recreation (Change on preprocess and code structure)
+In code, change path of the original dataset (no split folder for train/test) in `VCTK_ROOT = r"*"` (or find the suitable way for path structure in different OS)
+
+
 For using a small subset of speakers (faster, low resource required), run `python .\main_vctk_10.py` in ternimal. <br>
 For using all of speakers in vctk (much slower, very high resource required), run `python .\main_vctk_100.py` in ternimal. <br>
 
