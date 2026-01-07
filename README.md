@@ -1,5 +1,11 @@
 # speakerbox
+--------------------------------------------------------------
+# Tang's reimplementation
+To run the original model, install the dependency `pip install speakerbox` with perferable virtual environment (conda or venv).
+Then run `python .\main_github.py` in ternimal
 
+
+--------------------------------------------------------------
 [![Build Status](https://github.com/CouncilDataProject/speakerbox/workflows/CI/badge.svg)](https://github.com/CouncilDataProject/speakerbox/actions)
 [![Documentation](https://github.com/CouncilDataProject/speakerbox/workflows/Documentation/badge.svg)](https://CouncilDataProject.github.io/speakerbox)
 [![status](https://joss.theoj.org/papers/49cfcef1769c812ce4ff2e388a5c7641/status.svg)](https://joss.theoj.org/papers/49cfcef1769c812ce4ff2e388a5c7641)
