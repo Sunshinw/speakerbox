@@ -207,9 +207,22 @@ def train(
         TrainingArguments,
         Wav2Vec2FeatureExtractor,
         Wav2Vec2ForSequenceClassification,
+        DataCollatorWithPadding, # Added Import
     )
 
     from .utils import set_global_seed
+
+    # --- 🔥 FIX: Custom Data Collator to handle Long/Int conversion ---
+    class DataCollatorWithPaddingAndLabels(DataCollatorWithPadding):
+        def __call__(self, features):
+            batch = super().__call__(features)
+            # Force labels to be int64 (Long) for PyTorch CrossEntropyLoss
+            if "labels" in batch:
+                batch["labels"] = batch["labels"].to(torch.long)
+            if "label" in batch:
+                batch["labels"] = batch.pop("label").to(torch.long)
+            return batch
+    # ------------------------------------------------------------------
 
     # Handle seed
     if seed:
@@ -276,6 +289,9 @@ def train(
         predictions = np.argmax(eval_pred.predictions[0], axis=-1)
         return metric.compute(predictions=predictions, references=eval_pred.label_ids)
 
+    # Init Data Collator
+    data_collator = DataCollatorWithPaddingAndLabels(tokenizer=feature_extractor)
+
     # Trainer and train!
     trainer = Trainer(
         model,
@@ -283,6 +299,7 @@ def train(
         train_dataset=dataset["train"],
         eval_dataset=dataset["test"],
         tokenizer=feature_extractor,
+        data_collator=data_collator, # 🔥 PASS THE FIXED COLLATOR HERE
         compute_metrics=compute_metrics,
     )
     torch.cuda.empty_cache()
