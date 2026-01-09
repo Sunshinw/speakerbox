@@ -2,7 +2,7 @@
 --------------------------------------------------------------
 # Tang's reimplementation
 To run the original model, install the dependency `pip install speakerbox` with perferable virtual environment (conda or venv). <br>
-Then run `python .\main_github.py` in terminal. <br>
+Then run `python .\main_example.py` in terminal. <br>
 
 # VCTK dataset recreation (Change on preprocess and code structure)
 In code, change path of the original dataset (no split folder for train/test) in `VCTK_ROOT = r"*"` (or find the suitable way for path structure in different OS)
