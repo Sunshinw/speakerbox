@@ -32,7 +32,7 @@ EVAL_RESULTS_TEMPLATE = """
 """
 
 DEFAULT_TRAINER_ARGUMENTS_ARGS = {
-    "evaluation_strategy": "epoch",
+    "eval_strategy": "epoch",
     "save_strategy": "epoch",
     "learning_rate": 3e-5,
     "per_device_train_batch_size": 8,
@@ -163,109 +163,61 @@ def train(
     trainer_arguments_kws: Dict[str, Any] = DEFAULT_TRAINER_ARGUMENTS_ARGS,
 ) -> Path:
     """
-    Train a speaker classification model.
+    Train a speaker classification model (LAZY feature extraction to avoid RAM blow-up).
 
-    Parameters
-    ----------
-    dataset: DatasetDict
-        The datasets to use for training, testing, and validation.
-        Should only contain the columns/features: "label" and "audio".
-        The values in the "audio" column should be paths to the audio files.
-    model_name: str
-        A name for the model. This will also create a directory with the
-        same name to store the produced model in.
-        Default: "trained-speakerbox"
-    model_base: str
-        The model base to use before fine tuning.
-    max_duration: float
-        The maximum duration to use for each audio clip.
-        Any clips longer than this will be trimmed.
-        Default: 2.0
-    seed: Optional[int]
-        Seed to pass to torch, numpy, and Python RNGs.
-        Default: None (do not set a seed)
-    use_cpu: bool
-        Should the model be trained using CPU.
-        This also sets `no_cuda=True` on TrainerArguments.
-        Default: False (use GPU if available)
-    trainer_arguments_kws: Dict[Any]
-        Any additional keyword arguments to be passed to the HuggingFace
-        TrainerArguments object.
-        Default: DEFAULT_TRAINER_ARGUMENTS_ARGS
-
-    Returns
-    -------
-    model_storage_path: Path
-        The path to the directory where the model is stored.
+    Key change:
+    - Do NOT dataset.map(preprocess) to materialize input_values for whole dataset.
+    - Read audio + extract features inside a custom data_collator per-batch.
     """
     import numpy as np
     import torch
     import transformers
-    from datasets import Audio, load_metric
+    import soundfile as sf
+    from datasets import Audio
+    from evaluate import load as load_metric
     from transformers import (
         Trainer,
         TrainingArguments,
         Wav2Vec2FeatureExtractor,
         Wav2Vec2ForSequenceClassification,
-        DataCollatorWithPadding, # Added Import
     )
 
     from .utils import set_global_seed
 
-    # --- 🔥 FIX: Custom Data Collator to handle Long/Int conversion ---
-    class DataCollatorWithPaddingAndLabels(DataCollatorWithPadding):
-        def __call__(self, features):
-            batch = super().__call__(features)
-            # Force labels to be int64 (Long) for PyTorch CrossEntropyLoss
-            if "labels" in batch:
-                batch["labels"] = batch["labels"].to(torch.long)
-            if "label" in batch:
-                batch["labels"] = batch.pop("label").to(torch.long)
-            return batch
-    # ------------------------------------------------------------------
-
     # Handle seed
-    if seed:
+    if seed is not None:
         set_global_seed(seed)
 
     # Handle cpu
     if use_cpu:
         trainer_arguments_kws["no_cuda"] = True
 
+    # ---- Recommended defaults for Mac/MPS stability ----
+    # (keep user's values if already provided)
+    trainer_arguments_kws.setdefault("remove_unused_columns", False)
+    trainer_arguments_kws.setdefault("dataloader_pin_memory", False)  # MPS doesn't benefit
+    trainer_arguments_kws.setdefault("dataloader_num_workers", 1)
+    trainer_arguments_kws.setdefault("logging_strategy", "steps")
+    trainer_arguments_kws.setdefault("logging_steps", 100)
+    # ---------------------------------------------------
+
     # Load feature extractor
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_base)
 
-    # Convert dataset audios
-    log.info("Casting all audio paths to torch Audio")
-    dataset = dataset.cast_column("audio", Audio(feature_extractor.sampling_rate))
+    # Keep audio as PATH only (no decode, no torchcodec needed)
+    log.info("Casting all audio paths to HF Audio (decode=False)")
+    dataset = dataset.cast_column(
+        "audio", Audio(sampling_rate=feature_extractor.sampling_rate, decode=False)
+    )
 
-    # Construct label to id and vice-versa LUTs
+    # Build label LUTs
     label2id, id2label = {}, {}
     for i, label in enumerate(dataset["train"].features["label"].names):
         label2id[label] = str(i)
         id2label[str(i)] = label
 
-    # Construct preprocessing function
-    def preprocess(
-        examples: "arrow_dataset.Batch",
-    ) -> "feature_extraction_utils.BatchFeature":
-        audio_arrays = [x["array"] for x in examples["audio"]]
-        inputs = feature_extractor(
-            audio_arrays,
-            sampling_rate=feature_extractor.sampling_rate,
-            max_length=int(feature_extractor.sampling_rate * max_duration),
-            do_normalize=True,
-            truncation=True,
-            padding=True,
-        )
-        return inputs
-
-    # Encode the dataset
-    log.info("Extracting features from audio")
-    dataset = dataset.map(preprocess, batched=True)
-
     # Create AutoModel
-    log.info("Setting up Trainer")
+    log.info("Setting up model")
     model = Wav2Vec2ForSequenceClassification.from_pretrained(
         model_base,
         num_labels=len(id2label),
@@ -274,42 +226,84 @@ def train(
         ignore_mismatched_sizes=True,
     )
 
-    # Create fine tuning Trainer
+    # Training args
     args = TrainingArguments(
-        model_name,
+        output_dir=model_name,
         **trainer_arguments_kws,
     )
 
-    # Compute accuracy metrics
+    # Metrics
     metric = load_metric("accuracy")
 
     def compute_metrics(eval_pred: "EvalPrediction") -> Optional[Dict]:
-        # Eval pred comes with both the predictions and the attention mask
-        # grab just the predictions
-        predictions = np.argmax(eval_pred.predictions[0], axis=-1)
-        return metric.compute(predictions=predictions, references=eval_pred.label_ids)
+        preds = np.argmax(eval_pred.predictions, axis=-1)
+        return metric.compute(predictions=preds, references=eval_pred.label_ids)
 
-    # Init Data Collator
-    data_collator = DataCollatorWithPaddingAndLabels(tokenizer=feature_extractor)
+    # ---- LAZY COLLATOR: load audio -> extract features per batch ----
+    class LazyAudioCollator:
+        def __init__(self, fe, max_duration_s: float):
+            self.fe = fe
+            self.max_len = int(fe.sampling_rate * max_duration_s)
 
-    # Trainer and train!
+        def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+            # features are raw rows from dataset
+            paths = [f["audio"]["path"] for f in features]
+            labels = torch.tensor([f["label"] for f in features], dtype=torch.long)
+
+            audio_arrays: List[np.ndarray] = []
+            for p in paths:
+                wav, sr = sf.read(p)
+                if wav.ndim > 1:
+                    wav = wav[:, 0]
+                if sr != self.fe.sampling_rate:
+                    raise ValueError(
+                        f"Sample rate mismatch: {sr} vs {self.fe.sampling_rate} for {p}"
+                    )
+                audio_arrays.append(wav.astype(np.float32))
+
+            batch = self.fe(
+                audio_arrays,
+                sampling_rate=self.fe.sampling_rate,
+                max_length=self.max_len,
+                truncation=True,
+                padding=True,          # pad inside batch
+                return_tensors="pt",
+            )
+            batch["labels"] = labels
+            return batch
+
+    data_collator = LazyAudioCollator(feature_extractor, max_duration)
+
+    # ---- Small eval during training (fast sanity check) ----
+    # Note: only works if dataset["test"] >= 500
+    eval_n = min(500, len(dataset["test"]))
+    eval_small = dataset["test"].shuffle(seed=0).select(range(eval_n))
+
+    log.info(f"Using eval_small={eval_n} samples during training")
+
+    # Train
     trainer = Trainer(
-        model,
-        args,
+        model=model,
+        args=args,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["test"],
-        tokenizer=feature_extractor,
-        data_collator=data_collator, # 🔥 PASS THE FIXED COLLATOR HERE
+        eval_dataset=eval_small,
+        data_collator=data_collator,   # ✅ critical
         compute_metrics=compute_metrics,
     )
+
+    # Optional: reduce MPS fragmentation risk
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
     torch.cuda.empty_cache()
+
     transformers.logging.set_verbosity_info()
     trainer.train()
 
-    # Save model
+    # Save
     trainer.save_model()
 
     return Path(model_name).resolve()
+
 
 
 def apply(  # noqa: C901
