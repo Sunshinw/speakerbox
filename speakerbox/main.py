@@ -98,16 +98,32 @@ def eval_model(
     )
     log.info("Running eval")
 
+    import librosa  # Make sure librosa is installed: pip install librosa
+
     def predict(example: "datasets.arrow_dataset.Example") -> Dict[str, Any]:
-        pred = classifier(example["audio"], top_k=1000)
+        # 1. Get the path (since example["audio"] is a string)
+        audio_path = example["audio"]
+        
+        # 2. Manually load the audio to a numpy array
+        # We use the sampling rate the model expects
+        speech, _ = librosa.load(
+            audio_path, 
+            sr=classifier.feature_extractor.sampling_rate
+        )
+        
+        # 3. Pass the numpy array to the classifier
+        # This avoids the pipeline trying to use torchcodec/ffmpeg internally
+        pred = classifier(speech, top_k=1000)
+        
         pred_as_dict = {i["label"]: i["score"] for i in pred}
-        top_pred = max(pred_as_dict, key=pred_as_dict.get)  # type: ignore
+        top_pred = max(pred_as_dict, key=pred_as_dict.get)
+        
         return {
             "pred_label": top_pred,
             "true_label": classifier.model.config.id2label[example["label"]],
             "pred_scores": [i["score"] for i in pred],
         }
-
+    
     validation_dataset = validation_dataset.map(predict)
 
     # Create confusion
@@ -235,9 +251,14 @@ def train(
     # Metrics
     metric = load_metric("accuracy")
 
-    def compute_metrics(eval_pred: "EvalPrediction") -> Optional[Dict]:
-        preds = np.argmax(eval_pred.predictions, axis=-1)
+    def compute_metrics(eval_pred):
+        logits = eval_pred.predictions
+        if isinstance(logits, tuple):
+            logits = logits[0]  # 🔥 FIX: extract logits
+
+        preds = np.argmax(logits, axis=-1)
         return metric.compute(predictions=preds, references=eval_pred.label_ids)
+
 
     # ---- LAZY COLLATOR: load audio -> extract features per batch ----
     class LazyAudioCollator:
@@ -297,10 +318,12 @@ def train(
     torch.cuda.empty_cache()
 
     transformers.logging.set_verbosity_info()
-    trainer.train()
+    trainer.train(resume_from_checkpoint=True)
 
     # Save
     trainer.save_model()
+
+    feature_extractor.save_pretrained(model_name)
 
     return Path(model_name).resolve()
 
@@ -537,3 +560,6 @@ def apply(  # noqa: C901
         # Always clean up tmp file
         if tmp_audio_chunk_save_path.exists():
             tmp_audio_chunk_save_path.unlink()
+
+
+
