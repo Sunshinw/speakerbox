@@ -98,32 +98,44 @@ def eval_model(
     )
     log.info("Running eval")
 
-    import librosa  # Make sure librosa is installed: pip install librosa
+
+    import librosa
+    import torch
+    import torch.nn.functional as F
 
     def predict(example: "datasets.arrow_dataset.Example") -> Dict[str, Any]:
-        # 1. Get the path (since example["audio"] is a string)
+        # 1. Get the path
         audio_path = example["audio"]
         
-        # 2. Manually load the audio to a numpy array
-        # We use the sampling rate the model expects
+        # 2. Load audio
         speech, _ = librosa.load(
             audio_path, 
             sr=classifier.feature_extractor.sampling_rate
         )
         
-        # 3. Pass the numpy array to the classifier
-        # This avoids the pipeline trying to use torchcodec/ffmpeg internally
-        pred = classifier(speech, top_k=1000)
+        # 3. Get predictions from pipeline
+        # We ask for all labels (top_k=None or top_k=total_labels) to ensure 
+        # we get a full probability distribution for Log Loss.
+        num_labels = len(classifier.model.config.id2label)
+        pred = classifier(speech, top_k=num_labels)
         
-        pred_as_dict = {i["label"]: i["score"] for i in pred}
-        top_pred = max(pred_as_dict, key=pred_as_dict.get)
+        # 4. CRITICAL: Sort predictions by Label ID
+        # The pipeline might return labels in order of confidence (highest first).
+        # sklearn's log_loss needs them in order of ID (0, 1, 2...).
+        label2id = classifier.model.config.label2id
+        sorted_pred = sorted(pred, key=lambda x: label2id[x["label"]])
+        prob_list = [i["score"] for i in sorted_pred]
+        
+        # 5. Identify the top prediction
+        # We can get this from our sorted list or the original pred[0]
+        top_pred_label = pred[0]["label"]
         
         return {
-            "pred_label": top_pred,
+            "pred_label": top_pred_label,
             "true_label": classifier.model.config.id2label[example["label"]],
-            "pred_scores": [i["score"] for i in pred],
+            "pred_scores": prob_list,
         }
-    
+        
     validation_dataset = validation_dataset.map(predict)
 
     # Create confusion
