@@ -101,34 +101,39 @@ def eval_model(
 
     import librosa
     import torch
-    import torch.nn.functional as F
+    import torch.nn.functional as F    
+    from typing import Dict, Any
 
     def predict(example: "datasets.arrow_dataset.Example") -> Dict[str, Any]:
         # 1. Get the path
         audio_path = example["audio"]
         
         # 2. Load audio
+        # Using the sampling rate from the model's feature extractor (usually 16kHz)
         speech, _ = librosa.load(
             audio_path, 
             sr=classifier.feature_extractor.sampling_rate
         )
         
         # 3. Get predictions from pipeline
-        # We ask for all labels (top_k=None or top_k=total_labels) to ensure 
-        # we get a full probability distribution for Log Loss.
+        # We must get ALL labels to ensure Log Loss has a probability for every speaker
         num_labels = len(classifier.model.config.id2label)
         pred = classifier(speech, top_k=num_labels)
         
-        # 4. CRITICAL: Sort predictions by Label ID
-        # The pipeline might return labels in order of confidence (highest first).
-        # sklearn's log_loss needs them in order of ID (0, 1, 2...).
+        # 4. CRITICAL: Sort by Label ID
+        # Hugging Face pipelines return results sorted by SCORE (highest first).
+        # Scikit-learn's log_loss expects them sorted by ID (0, 1, 2...).
         label2id = classifier.model.config.label2id
         sorted_pred = sorted(pred, key=lambda x: label2id[x["label"]])
-        total = sum(prob_list)
-        prob_list = [p / total for p in prob_list]
         
-        # 5. Identify the top prediction
-        # We can get this from our sorted list or the original pred[0]
+        # 5. Extract scores and normalize
+        # We normalize to 1.0 to satisfy the sklearn check and ensure precision
+        raw_probs = [i["score"] for i in sorted_pred]
+        total_score = sum(raw_probs)
+        prob_list = [p / total_score for p in raw_probs]
+        
+        # 6. Get the top prediction for Accuracy calculation
+        # Since 'pred' was originally sorted by score, pred[0] is the top one
         top_pred_label = pred[0]["label"]
         
         return {
