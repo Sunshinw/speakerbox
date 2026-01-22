@@ -124,7 +124,8 @@ def eval_model(
         # sklearn's log_loss needs them in order of ID (0, 1, 2...).
         label2id = classifier.model.config.label2id
         sorted_pred = sorted(pred, key=lambda x: label2id[x["label"]])
-        prob_list = [i["score"] for i in sorted_pred]
+        total = sum(prob_list)
+        prob_list = [p / total for p in prob_list]
         
         # 5. Identify the top prediction
         # We can get this from our sorted list or the original pred[0]
