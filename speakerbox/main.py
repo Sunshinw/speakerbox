@@ -336,7 +336,7 @@ def train(
     torch.cuda.empty_cache()
 
     transformers.logging.set_verbosity_info()
-    trainer.train(resume_from_checkpoint=True)
+    trainer.train(resume_from_checkpoint=False)
     trainer.save_model()
     feature_extractor.save_pretrained(model_name)
 
