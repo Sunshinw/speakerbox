@@ -2,14 +2,14 @@ import logging
 import pandas as pd
 from pathlib import Path
 from sklearn.model_selection import train_test_split
-from datasets import Dataset, DatasetDict
+from datasets import Audio, Dataset, DatasetDict
 from speakerbox import train, eval_model
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# VCTK_ROOT = r"C:\Users\sunshine\Desktop\DS_10283_3443\VCTK-Corpus-0.92\wav48_silence_trimmed"
-VCTK_ROOT = ""
+VCTK_ROOT = r"C:\Users\sunshine\Desktop\DS_10283_3443\VCTK-Corpus-0.92\wav48_silence_trimmed"
+# VCTK_ROOT = ""
 OUTPUT_MODEL_NAME = "vctk_prod_model_full"
 MIN_FILES = 5
 
@@ -36,18 +36,26 @@ def prepare_prod_dataset(root_path: str) -> DatasetDict:
     valid_speakers = counts[counts >= MIN_FILES].index
     df = df[df.label.isin(valid_speakers)]
     log.info(f"Training on {len(valid_speakers)} speakers")
+    # --- 80-10-10 SPLIT LOGIC ---
+    unique_files = df["audio"].unique()
 
-    unique_ids = df.conversation_id.unique()
-    train_ids, test_ids = train_test_split(unique_ids, test_size=0.2, random_state=42)
+    # 1. Split off 80% for training
+    train_files, temp_files = train_test_split(
+        unique_files, test_size=0.20, random_state=42
+    )
 
-    train_df = df[df.conversation_id.isin(train_ids)]
-    test_df = df[df.conversation_id.isin(test_ids)]
+    # 2. Split the remaining 20% into two halves (10% Valid, 10% Test)
+    valid_files, test_files = train_test_split(
+        temp_files, test_size=0.50, random_state=42
+    )
 
     dataset = DatasetDict({
-        "train": Dataset.from_pandas(train_df, preserve_index=False),
-        "test": Dataset.from_pandas(test_df, preserve_index=False)
+        "train": Dataset.from_pandas(df[df["audio"].isin(train_files)], preserve_index=False),
+        "valid": Dataset.from_pandas(df[df["audio"].isin(valid_files)], preserve_index=False),
+        "test": Dataset.from_pandas(df[df["audio"].isin(test_files)], preserve_index=False)
     })
 
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
     dataset = dataset.class_encode_column("label")
 
     return dataset
