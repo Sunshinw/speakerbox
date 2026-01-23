@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 from transformers import pipeline
+import torch
+import soundfile as sf
+import numpy as np
 
 if TYPE_CHECKING:
     import datasets
@@ -49,7 +52,37 @@ DEFAULT_TRAINER_ARGUMENTS_ARGS = {
 
 
 ###############################################################################
+# ---- LAZY COLLATOR: load audio -> extract features per batch ----
+class LazyAudioCollator:
+    def __init__(self, fe, max_duration_s: float):
+        self.fe = fe
+        self.max_len = int(fe.sampling_rate * max_duration_s)
 
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        import librosa  # Using librosa for easy resampling
+        import numpy as np
+        import torch
+
+        paths = [f["audio"]["path"] for f in features]
+        labels = torch.tensor([f["label"] for f in features], dtype=torch.long)
+
+        audio_arrays: List[np.ndarray] = []
+        for p in paths:
+            # librosa.load automatically resamples to the target sr (16000)
+            # and converts to mono by default.
+            wav, _ = librosa.load(p, sr=self.fe.sampling_rate)
+            audio_arrays.append(wav)
+
+        batch = self.fe(
+            audio_arrays,
+            sampling_rate=self.fe.sampling_rate,
+            max_length=self.max_len,
+            truncation=True,
+            padding=True,
+            return_tensors="pt",
+        )
+        batch["labels"] = labels
+        return batch
 
 def eval_model(
     validation_dataset: "Dataset",
@@ -207,8 +240,7 @@ def train(
     import torch
     import transformers
     import soundfile as sf
-    from datasets import Audio
-    from evaluate import load as load_metric
+    from datasets import Audio, load_metric
     from transformers import (
         Trainer,
         TrainingArguments,
@@ -238,7 +270,6 @@ def train(
     # Load feature extractor
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_base)
 
-    # Keep audio as PATH only (no decode, no torchcodec needed)
     log.info("Casting all audio paths to HF Audio (decode=False)")
     dataset = dataset.cast_column(
         "audio", Audio(sampling_rate=feature_extractor.sampling_rate, decode=False)
@@ -260,7 +291,17 @@ def train(
         ignore_mismatched_sizes=True,
     )
 
-    # Training args
+    # Set evaluation strategy to epoch if validation set is present
+    if "valid" in dataset:
+        trainer_arguments_kws.setdefault("evaluation_strategy", "epoch")
+        eval_dataset = dataset["valid"]
+        log.info(f"Using provided 'valid' dataset for evaluation ({len(eval_dataset)} samples)")
+    else:
+        # Fallback to small slice of test if no valid set provided
+        eval_n = min(500, len(dataset["test"]))
+        eval_dataset = dataset["test"].shuffle(seed=0).select(range(eval_n))
+        log.info(f"No valid set found. Using eval_small={eval_n} samples from test")
+
     args = TrainingArguments(
         output_dir=model_name,
         **trainer_arguments_kws,
@@ -277,70 +318,26 @@ def train(
         preds = np.argmax(logits, axis=-1)
         return metric.compute(predictions=preds, references=eval_pred.label_ids)
 
-
-    # ---- LAZY COLLATOR: load audio -> extract features per batch ----
-    class LazyAudioCollator:
-        def __init__(self, fe, max_duration_s: float):
-            self.fe = fe
-            self.max_len = int(fe.sampling_rate * max_duration_s)
-
-        def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-            # features are raw rows from dataset
-            paths = [f["audio"]["path"] for f in features]
-            labels = torch.tensor([f["label"] for f in features], dtype=torch.long)
-
-            audio_arrays: List[np.ndarray] = []
-            for p in paths:
-                wav, sr = sf.read(p)
-                if wav.ndim > 1:
-                    wav = wav[:, 0]
-                if sr != self.fe.sampling_rate:
-                    raise ValueError(
-                        f"Sample rate mismatch: {sr} vs {self.fe.sampling_rate} for {p}"
-                    )
-                audio_arrays.append(wav.astype(np.float32))
-
-            batch = self.fe(
-                audio_arrays,
-                sampling_rate=self.fe.sampling_rate,
-                max_length=self.max_len,
-                truncation=True,
-                padding=True,          # pad inside batch
-                return_tensors="pt",
-            )
-            batch["labels"] = labels
-            return batch
-
     data_collator = LazyAudioCollator(feature_extractor, max_duration)
-
-    # ---- Small eval during training (fast sanity check) ----
-    # Note: only works if dataset["test"] >= 500
-    eval_n = min(500, len(dataset["test"]))
-    eval_small = dataset["test"].shuffle(seed=0).select(range(eval_n))
-
-    log.info(f"Using eval_small={eval_n} samples during training")
 
     # Train
     trainer = Trainer(
         model=model,
         args=args,
         train_dataset=dataset["train"],
-        eval_dataset=eval_small,
-        data_collator=data_collator,   # ✅ critical
+        eval_dataset=eval_dataset, # ✅ Now uses 10% valid split
+        data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
-
-    # Optional: reduce MPS fragmentation risk
+    
+     # Optional: reduce MPS fragmentation risk
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()
     torch.cuda.empty_cache()
 
     transformers.logging.set_verbosity_info()
     trainer.train(resume_from_checkpoint=True)
-
-    # Save
     trainer.save_model()
-
     feature_extractor.save_pretrained(model_name)
 
     return Path(model_name).resolve()
