@@ -130,3 +130,7 @@ training-data/
 unannotated/
 cdp-datasets/
 example-speakerbox-dataset/
+
+
+vctk_prod_model_full/
+vctk_experiment_data/

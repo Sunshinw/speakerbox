@@ -105,39 +105,33 @@ def eval_model(
     from typing import Dict, Any
 
     def predict(example: "datasets.arrow_dataset.Example") -> Dict[str, Any]:
-        # 1. Get the path
         audio_path = example["audio"]
+        speech, _ = librosa.load(audio_path, sr=classifier.feature_extractor.sampling_rate)
         
-        # 2. Load audio
-        # Using the sampling rate from the model's feature extractor (usually 16kHz)
-        speech, _ = librosa.load(
-            audio_path, 
-            sr=classifier.feature_extractor.sampling_rate
-        )
+        # Get total labels from config
+        label2id = classifier.model.config.label2id
+        num_labels = len(label2id)
         
-        # 3. Get predictions from pipeline
-        # We must get ALL labels to ensure Log Loss has a probability for every speaker
-        num_labels = len(classifier.model.config.id2label)
+        # Get predictions from pipeline
         pred = classifier(speech, top_k=num_labels)
         
-        # 4. CRITICAL: Sort by Label ID
-        # Hugging Face pipelines return results sorted by SCORE (highest first).
-        # Scikit-learn's log_loss expects them sorted by ID (0, 1, 2...).
-        label2id = classifier.model.config.label2id
-        sorted_pred = sorted(pred, key=lambda x: label2id[x["label"]])
+        # CRITICAL: Create an empty list of zeros for the full distribution
+        # This ensures every speaker has a slot, even if the model gave it 0.0
+        prob_list = [0.0] * num_labels
         
-        # 5. Extract scores and normalize
-        # We normalize to 1.0 to satisfy the sklearn check and ensure precision
-        raw_probs = [i["score"] for i in sorted_pred]
-        total_score = sum(raw_probs)
-        prob_list = [p / total_score for p in raw_probs]
-        
-        # 6. Get the top prediction for Accuracy calculation
-        # Since 'pred' was originally sorted by score, pred[0] is the top one
-        top_pred_label = pred[0]["label"]
+        for item in pred:
+            label_str = item["label"]
+            score = item["score"]
+            # Use the config's mapping to place the score in the correct index
+            idx = int(label2id[label_str])
+            prob_list[idx] = score
+
+        # Normalize to ensure sum is exactly 1.0 (prevents sklearn warnings)
+        total = sum(prob_list)
+        prob_list = [p / total for p in prob_list]
         
         return {
-            "pred_label": top_pred_label,
+            "pred_label": pred[0]["label"],
             "true_label": classifier.model.config.id2label[example["label"]],
             "pred_scores": prob_list,
         }

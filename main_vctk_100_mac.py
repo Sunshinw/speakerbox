@@ -6,7 +6,10 @@ from pathlib import Path
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from datasets import Dataset, DatasetDict
+# from datasets import Dataset, DatasetDict
+from evaluate import load as load_metric
+from datasets import Dataset, DatasetDict, Audio
+
 
 from speakerbox import train, eval_model
 
@@ -22,7 +25,7 @@ log = logging.getLogger(__name__)
 # -------------------------
 # Config
 # -------------------------
-VCTK_ROOT = "/Users/napatkritasavarojpanich/Desktop/VCTK/VCTK-Corpus/wav16"
+VCTK_ROOT = "/Users/pakap/Documents/Senior/Code/ECAPA_Libri/VCTK_WAV"
 OUTPUT_MODEL_NAME = "vctk_prod_model_full"
 MIN_FILES = 5
 
@@ -101,11 +104,11 @@ def main():
 
         # if your speakerbox uses "eval_strategy" (newer key), keep it as is:
         "eval_strategy": "steps",
-        "eval_steps": 4000,
+        "eval_steps": 1000,
         "eval_accumulation_steps": 1,
 
         "save_strategy": "steps",
-        "save_steps": 4000,
+        "save_steps": 1000,
         "save_total_limit": 2,
 
         # SAFE defaults for macOS (avoid pickle crash)
