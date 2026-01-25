@@ -5,7 +5,9 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from sklearn.model_selection import train_test_split
-from datasets import Dataset, DatasetDict, Audio, load_metric
+from datasets import Dataset, DatasetDict
+from datasets import Audio
+from evaluate import load as load_metric
 from transformers import (
     Wav2Vec2FeatureExtractor,
     Wav2Vec2ForSequenceClassification,

@@ -11,6 +11,7 @@ from evaluate import load as load_metric
 from datasets import Dataset, DatasetDict, Audio
 
 
+
 from speakerbox import train, eval_model
 
 # -------------------------
@@ -93,7 +94,7 @@ def main():
         "gradient_accumulation_steps": 2,
         "per_device_train_batch_size": 4,
         "per_device_eval_batch_size": 1,
-        "num_train_epochs": 3,
+        "num_train_epochs": 10,
 
         "fp16": False,
         "learning_rate": 1e-5,

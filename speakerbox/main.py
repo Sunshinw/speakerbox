@@ -12,8 +12,11 @@ import numpy as np
 if TYPE_CHECKING:
     import datasets
     from datasets import Dataset, DatasetDict, arrow_dataset
+    from datasets import Audio
+    from evaluate import load as load_metric
     from pyannote.core.annotation import Annotation
     from transformers import EvalPrediction, feature_extraction_utils
+
 
 ###############################################################################
 
@@ -234,7 +237,9 @@ def train(
     import torch
     import transformers
     import soundfile as sf
-    from datasets import Audio, load_metric
+    from datasets import Audio
+    from evaluate import load as load_metric
+    
     from transformers import (
         Trainer,
         TrainingArguments,
