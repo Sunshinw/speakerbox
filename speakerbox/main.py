@@ -292,7 +292,7 @@ def train(
 
     # Set evaluation strategy to epoch if validation set is present
     if "valid" in dataset:
-        trainer_arguments_kws.setdefault("evaluation_strategy", "epoch")
+        trainer_arguments_kws.setdefault("eval_strategy", "epoch")
         eval_dataset = dataset["valid"]
         log.info(f"Using provided 'valid' dataset for evaluation ({len(eval_dataset)} samples)")
     else:
