@@ -40,18 +40,18 @@ EVAL_RESULTS_TEMPLATE = """
 DEFAULT_TRAINER_ARGUMENTS_ARGS = {
     "eval_strategy": "epoch",
     "save_strategy": "steps",
-    "save_steps": 500,
+    "save_steps": 100,
     "learning_rate": 3e-5,
     "per_device_train_batch_size": 8,
     "gradient_accumulation_steps": 1,
-    "eval_accumulation_steps": 40,
-    "per_device_eval_batch_size": 32,
+    "eval_accumulation_steps": 1,
+    "per_device_eval_batch_size": 8,
     "num_train_epochs": 5,
     "warmup_ratio": 0.1,
     "logging_steps": 10,
     "load_best_model_at_end": True,
     "metric_for_best_model": "accuracy",
-    "gradient_checkpointing": True,
+    "gradient_checkpointing": False,
 }
 
 
@@ -287,13 +287,30 @@ def train(
     # (keep user's values if already provided)
     trainer_arguments_kws.setdefault("remove_unused_columns", False)
     trainer_arguments_kws.setdefault("dataloader_pin_memory", False)  # MPS doesn't benefit
-    trainer_arguments_kws.setdefault("dataloader_num_workers", 4)
+    trainer_arguments_kws.setdefault("dataloader_num_workers", 0)
     trainer_arguments_kws.setdefault("logging_strategy", "steps")
     trainer_arguments_kws.setdefault("logging_steps", 100)
     # ---------------------------------------------------
 
     # Load feature extractor
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_base)
+    
+    # Build label LUTs
+    label2id, id2label = {}, {}
+    for i, label in enumerate(dataset["train"].features["label"].names):
+        label2id[label] = str(i)
+        id2label[str(i)] = label
+
+    # Create AutoModel
+    log.info("Setting up model")
+    model = Wav2Vec2ForSequenceClassification.from_pretrained(
+        model_base,
+        num_labels=len(id2label),
+        label2id=label2id,
+        id2label=id2label,
+        ignore_mismatched_sizes=True,
+    )
+
 
     log.info("Casting all audio paths to HF Audio (decode=False)")
     dataset = dataset.cast_column(
