@@ -39,12 +39,13 @@ EVAL_RESULTS_TEMPLATE = """
 
 DEFAULT_TRAINER_ARGUMENTS_ARGS = {
     "eval_strategy": "epoch",
-    "save_strategy": "epoch",
+    "save_strategy": "steps",
+    "save_steps": 500,
     "learning_rate": 3e-5,
     "per_device_train_batch_size": 8,
     "gradient_accumulation_steps": 1,
     "eval_accumulation_steps": 40,
-    "per_device_eval_batch_size": 8,
+    "per_device_eval_batch_size": 32,
     "num_train_epochs": 5,
     "warmup_ratio": 0.1,
     "logging_steps": 10,
@@ -73,7 +74,7 @@ class LazyAudioCollator:
         for p in paths:
             # librosa.load automatically resamples to the target sr (16000)
             # and converts to mono by default.
-            wav, _ = librosa.load(p, sr=self.fe.sampling_rate)
+            wav, sr = sf.read(p)
             audio_arrays.append(wav)
 
         batch = self.fe(
@@ -86,6 +87,31 @@ class LazyAudioCollator:
         )
         batch["labels"] = labels
         return batch
+
+# ---- PRECOMPUTE FEATURES FOR FAST EVAL ----
+def preprocess_function(batch, feature_extractor, max_duration):
+    import soundfile as sf
+    import numpy as np
+
+    max_len = int(feature_extractor.sampling_rate * max_duration)
+
+    speech_list = []
+    for path in batch["audio"]["path"]:
+        wav, sr = sf.read(path)
+        speech_list.append(wav)
+
+    inputs = feature_extractor(
+        speech_list,
+        sampling_rate=feature_extractor.sampling_rate,
+        max_length=max_len,
+        truncation=True,
+        padding=True,
+        return_tensors="np",
+    )
+
+    batch["input_values"] = inputs["input_values"]
+    return batch
+
 
 def eval_model(
     validation_dataset: "Dataset",
@@ -261,7 +287,7 @@ def train(
     # (keep user's values if already provided)
     trainer_arguments_kws.setdefault("remove_unused_columns", False)
     trainer_arguments_kws.setdefault("dataloader_pin_memory", False)  # MPS doesn't benefit
-    trainer_arguments_kws.setdefault("dataloader_num_workers", 1)
+    trainer_arguments_kws.setdefault("dataloader_num_workers", 4)
     trainer_arguments_kws.setdefault("logging_strategy", "steps")
     trainer_arguments_kws.setdefault("logging_steps", 100)
     # ---------------------------------------------------
@@ -274,32 +300,25 @@ def train(
         "audio", Audio(sampling_rate=feature_extractor.sampling_rate, decode=False)
     )
 
-    # Build label LUTs
-    label2id, id2label = {}, {}
-    for i, label in enumerate(dataset["train"].features["label"].names):
-        label2id[label] = str(i)
-        id2label[str(i)] = label
-
-    # Create AutoModel
-    log.info("Setting up model")
-    model = Wav2Vec2ForSequenceClassification.from_pretrained(
-        model_base,
-        num_labels=len(id2label),
-        label2id=label2id,
-        id2label=id2label,
-        ignore_mismatched_sizes=True,
-    )
-
-    # Set evaluation strategy to epoch if validation set is present
+    # Select eval split first
     if "valid" in dataset:
         trainer_arguments_kws.setdefault("eval_strategy", "epoch")
         eval_dataset = dataset["valid"]
-        log.info(f"Using provided 'valid' dataset for evaluation ({len(eval_dataset)} samples)")
     else:
-        # Fallback to small slice of test if no valid set provided
         eval_n = min(500, len(dataset["test"]))
         eval_dataset = dataset["test"].shuffle(seed=0).select(range(eval_n))
-        log.info(f"No valid set found. Using eval_small={eval_n} samples from test")
+
+    # Precompute eval features
+    eval_dataset = eval_dataset.map(
+        preprocess_function,
+        batched=True,
+        batch_size=32,
+        fn_kwargs={
+            "feature_extractor": feature_extractor,
+            "max_duration": max_duration,
+        },
+    )
+    eval_dataset.set_format("torch", columns=["input_values", "label"])
 
     args = TrainingArguments(
         output_dir=model_name,
@@ -335,7 +354,7 @@ def train(
     torch.cuda.empty_cache()
 
     transformers.logging.set_verbosity_info()
-    trainer.train(resume_from_checkpoint=False)
+    trainer.train(resume_from_checkpoint=True)
     trainer.save_model()
     feature_extractor.save_pretrained(model_name)
 
