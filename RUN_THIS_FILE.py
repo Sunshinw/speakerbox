@@ -10,9 +10,9 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 # VCTK_ROOT = "/Users/pakap/Documents/Senior/Code/ECAPA_Libri/VCTK_WAV"
-VCTK_ROOT = "/Users/pakap/Documents/Senior/Code/ECAPA_Libri/libri500_WAV"
+VCTK_ROOT = "/Users/pakap/Documents/Senior/Code/ECAPA_TDNN/libri500_WAV"
 # VCTK_ROOT = ""
-OUTPUT_MODEL_NAME = "libri_prod_model"
+OUTPUT_MODEL_NAME = "exps/libri500"
 MIN_FILES = 1
 
 def prepare_prod_dataset(root_path: str) -> DatasetDict:
