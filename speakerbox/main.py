@@ -67,7 +67,14 @@ class LazyAudioCollator:
         import numpy as np
         import torch
 
-        paths = [f["audio"]["path"] for f in features]
+        paths = []
+        for f in features:
+            audio_data = f["audio"]
+            if isinstance(audio_data, dict):
+                paths.append(audio_data["path"])
+            else:
+                paths.append(str(audio_data))
+        
         labels = torch.tensor([f["label"] for f in features], dtype=torch.long)
 
         audio_arrays: List[np.ndarray] = []
