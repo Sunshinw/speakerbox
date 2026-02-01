@@ -95,8 +95,10 @@ def preprocess_function(batch, feature_extractor, max_duration):
 
     max_len = int(feature_extractor.sampling_rate * max_duration)
 
+    paths = [item["path"] for item in batch["audio"]]
+    
     speech_list = []
-    for path in batch["audio"]["path"]:
+    for path in paths:
         wav, sr = sf.read(path)
         speech_list.append(wav)
 
