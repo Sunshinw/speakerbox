@@ -63,15 +63,16 @@ class LazyAudioCollator:
         self.max_len = int(fe.sampling_rate * max_duration_s)
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        import librosa  # Using librosa for easy resampling
+        import soundfile as sf
         import numpy as np
         import torch
 
+        # Robust path extraction that handles both Dict and String formats
         paths = []
         for f in features:
-            audio_data = f["audio"]
+            audio_data = f.get("audio")
             if isinstance(audio_data, dict):
-                paths.append(audio_data["path"])
+                paths.append(audio_data.get("path"))
             else:
                 paths.append(str(audio_data))
         
@@ -79,9 +80,7 @@ class LazyAudioCollator:
 
         audio_arrays: List[np.ndarray] = []
         for p in paths:
-            # librosa.load automatically resamples to the target sr (16000)
-            # and converts to mono by default.
-            wav, sr = sf.read(p)
+            wav, _ = sf.read(p)
             audio_arrays.append(wav)
 
         batch = self.fe(
