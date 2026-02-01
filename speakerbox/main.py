@@ -54,7 +54,6 @@ DEFAULT_TRAINER_ARGUMENTS_ARGS = {
     "gradient_checkpointing": False,
 }
 
-
 ###############################################################################
 # ---- LAZY COLLATOR: load audio -> extract features per batch ----
 class LazyAudioCollator:
@@ -67,19 +66,31 @@ class LazyAudioCollator:
         import numpy as np
         import torch
 
-        # Robust path extraction that handles both Dict and String formats
         paths = []
+        valid_labels = []
+        
         for f in features:
             audio_data = f.get("audio")
+            path = None
+            
+            # Extract path from dictionary or string safely
             if isinstance(audio_data, dict):
-                paths.append(audio_data.get("path"))
+                path = audio_data.get("path")
+            elif audio_data is not None:
+                path = str(audio_data)
+            
+            # Only add to the batch if we actually found a file path
+            if path:
+                paths.append(path)
+                valid_labels.append(f["label"])
             else:
-                paths.append(str(audio_data))
-        
-        labels = torch.tensor([f["label"] for f in features], dtype=torch.long)
+                log.warning(f"Skipping empty audio path for speaker {f.get('label')}")
+
+        labels = torch.tensor(valid_labels, dtype=torch.long)
 
         audio_arrays: List[np.ndarray] = []
         for p in paths:
+            # sf.read is faster than librosa for raw loading on macOS
             wav, _ = sf.read(p)
             audio_arrays.append(wav)
 
@@ -93,7 +104,7 @@ class LazyAudioCollator:
         )
         batch["labels"] = labels
         return batch
-
+    
 # ---- PRECOMPUTE FEATURES FOR FAST EVAL ----
 def preprocess_function(batch, feature_extractor, max_duration):
     import soundfile as sf
@@ -120,6 +131,26 @@ def preprocess_function(batch, feature_extractor, max_duration):
     batch["input_values"] = inputs["input_values"]
     return batch
 
+from transformers import TrainerCallback
+import shutil
+
+class EpochArchiveCallback(TrainerCallback):
+    """
+    Saves a dedicated copy of the model in a new folder at the end of each epoch.
+    """
+    def on_epoch_end(self, args, state, control, **kwargs):
+        epoch_num = round(state.epoch)
+        # Define a unique folder name for this epoch
+        archive_path = Path(args.output_dir) / f"archive_epoch_{epoch_num}"
+        
+        log.info(f"Archiving model at end of epoch {epoch_num} to {archive_path}")
+        
+        # Save the model and feature extractor specifically to this folder
+        kwargs['model'].save_pretrained(archive_path)
+        if 'processing_class' in kwargs: # for newer transformers
+            kwargs['processing_class'].save_pretrained(archive_path)
+        elif 'feature_extractor' in kwargs:
+            kwargs['feature_extractor'].save_pretrained(archive_path)
 
 def eval_model(
     validation_dataset: "Dataset",
@@ -371,6 +402,7 @@ def train(
         eval_dataset=eval_dataset, # ✅ Now uses 10% valid split
         data_collator=data_collator,
         compute_metrics=compute_metrics,
+        callbacks=[EpochArchiveCallback()],
     )
     
      # Optional: reduce MPS fragmentation risk
