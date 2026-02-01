@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 # VCTK_ROOT = "/Users/pakap/Documents/Senior/Code/ECAPA_Libri/VCTK_WAV"
-VCTK_ROOT = "/Users/pakap/Documents/Senior/Code/ECAPA_TDNN/libri500_WAV"
+VCTK_ROOT = "/Users/pakap/Documents/Senior/Code/ECAPA_TDNN/Dataset/libri500_WAV"
 # VCTK_ROOT = ""
 OUTPUT_MODEL_NAME = "exps/libri500"
 MIN_FILES = 1
@@ -23,7 +23,7 @@ def prepare_prod_dataset(root_path: str) -> DatasetDict:
     log.info(f"Found {len(audio_files)} files. Processing...")
 
     for filepath in audio_files:
-        parts = filepath.name.split("-")
+        parts = filepath.name.split("-") #EDIT: libri500 uses '-'
         if len(parts) >= 2:
             data.append({
                 "audio": str(filepath.resolve()), 
