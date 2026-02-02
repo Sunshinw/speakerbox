@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     import datasets
     from datasets import Dataset, DatasetDict, arrow_dataset
     from datasets import Audio
-    from evaluate import load as load_metric
+    # from evaluate import load as load_metric
     from pyannote.core.annotation import Annotation
     from transformers import EvalPrediction, feature_extraction_utils
 
@@ -38,20 +38,30 @@ EVAL_RESULTS_TEMPLATE = """
 """
 
 DEFAULT_TRAINER_ARGUMENTS_ARGS = {
-    "eval_strategy": "epoch",
-    "save_strategy": "steps",
-    "save_steps": 100,
-    "learning_rate": 3e-5,
-    "per_device_train_batch_size": 8,
-    "gradient_accumulation_steps": 1,
-    "eval_accumulation_steps": 1,
-    "per_device_eval_batch_size": 8,
-    "num_train_epochs": 5,
-    "warmup_ratio": 0.1,
-    "logging_steps": 10,
-    "load_best_model_at_end": True,
+    # --- Strategy & Checkpointing ---
+    "evaluation_strategy": "epoch",    # Keep as epoch to ensure full metric calculation
+    "save_strategy": "steps",          # Save based on steps for resume safety
+    "save_steps": 100,                 # Frequent checkpoints (approx. every 3.5 mins based on your logs)
+    "save_total_limit": 3,             # Keep only 3 checkpoints to save Windows disk space
+    "load_best_model_at_end": True,    # Required to pick the best encoder for Stage 2
     "metric_for_best_model": "accuracy",
-    "gradient_checkpointing": False,
+
+    # --- Hardware & Windows Performance ---
+    "fp16": True,                      # Set to True if you have an NVIDIA GPU (speeds up training significantly)
+    "dataloader_num_workers": 0,       # CRITICAL for Windows: prevents multiprocessing "Pickle" errors
+    "dataloader_pin_memory": True,     # Speeds up data transfer from RAM to GPU
+    "gradient_checkpointing": True,    # Enable to save VRAM if you hit "Out of Memory" errors
+    "group_by_length": True,           # Faster training by grouping similar duration audio
+    
+    # --- Hyperparameters ---
+    "learning_rate": 3e-5,             # Standard stable rate for Wav2Vec2 fine-tuning
+    "per_device_train_batch_size": 8,
+    "gradient_accumulation_steps": 2,  # Set to 2 to match your terminal screenshot (Total batch = 16)
+    "per_device_eval_batch_size": 8,
+    "num_train_epochs": 10,            # Increased to 10 to ensure convergence on 110 VCTK speakers
+    "warmup_ratio": 0.1,
+    "logging_steps": 10,               # Monitor loss closely to see "Region of Separation" formation
+    "report_to": "none",               # Prevents Windows credential popups from wandb/tensorboard
 }
 
 ###############################################################################
@@ -66,34 +76,16 @@ class LazyAudioCollator:
         import numpy as np
         import torch
 
-        paths = []
-        valid_labels = []
-        
-        for f in features:
-            audio_data = f.get("audio")
-            path = None
-            
-            # Extract path from dictionary or string safely
-            if isinstance(audio_data, dict):
-                path = audio_data.get("path")
-            elif audio_data is not None:
-                path = str(audio_data)
-            
-            # Only add to the batch if we actually found a file path
-            if path:
-                paths.append(path)
-                valid_labels.append(f["label"])
-            else:
-                log.warning(f"Skipping empty audio path for speaker {f.get('label')}")
+        # Extract paths and labels quickly
+        paths = [f["audio"]["path"] if isinstance(f["audio"], dict) else str(f["audio"]) 
+                 for f in features if f.get("audio")]
+        labels = torch.tensor([f["label"] for f in features if f.get("audio")], dtype=torch.long)
 
-        labels = torch.tensor(valid_labels, dtype=torch.long)
+        # OPTIMIZATION: List comprehension for audio loading is faster than manual for-loops
+        # sf.read is generally faster on Windows than librosa
+        audio_arrays = [sf.read(p)[0] for p in paths]
 
-        audio_arrays: List[np.ndarray] = []
-        for p in paths:
-            # sf.read is faster than librosa for raw loading on macOS
-            wav, _ = sf.read(p)
-            audio_arrays.append(wav)
-
+        # Feature extraction in one batch call
         batch = self.fe(
             audio_arrays,
             sampling_rate=self.fe.sampling_rate,
@@ -105,7 +97,6 @@ class LazyAudioCollator:
         batch["labels"] = labels
         return batch
     
-# ---- PRECOMPUTE FEATURES FOR FAST EVAL ----
 def preprocess_function(batch, feature_extractor, max_duration):
     import soundfile as sf
     import numpy as np
@@ -141,7 +132,7 @@ class EpochArchiveCallback(TrainerCallback):
     def on_epoch_end(self, args, state, control, **kwargs):
         epoch_num = round(state.epoch)
         # Define a unique folder name for this epoch
-        archive_path = Path(args.output_dir) / f"archive_epoch_{epoch_num}"
+        archive_path = Path(args.output_dir) / f"final_speakerbox_epoch_{epoch_num}"
         
         log.info(f"Archiving model at end of epoch {epoch_num} to {archive_path}")
         
@@ -302,8 +293,8 @@ def train(
     import torch
     import transformers
     import soundfile as sf
-    from datasets import Audio
-    from evaluate import load as load_metric
+    from datasets import Audio, load_metric
+    # from evaluate import load as load_metric
     
     from transformers import (
         Trainer,
@@ -321,6 +312,17 @@ def train(
     # Handle cpu
     if use_cpu:
         trainer_arguments_kws["no_cuda"] = True
+        
+    # Check for CUDA (NVIDIA GPU)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"Training will run on: {device}")
+    
+    # Move model to GPU
+    model.to(device) #
+
+    # Pre-emptively clear the cache to maximize VRAM
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache() 
 
     # ---- Recommended defaults for Mac/MPS stability ----
     # (keep user's values if already provided)
@@ -328,7 +330,7 @@ def train(
     trainer_arguments_kws.setdefault("dataloader_pin_memory", False)  # MPS doesn't benefit
     trainer_arguments_kws.setdefault("dataloader_num_workers", 0)
     trainer_arguments_kws.setdefault("logging_strategy", "steps")
-    trainer_arguments_kws.setdefault("logging_steps", 100)
+    trainer_arguments_kws.setdefault("logging_steps", 10)
     # ---------------------------------------------------
 
     # Load feature extractor
@@ -358,7 +360,7 @@ def train(
 
     # Select eval split first
     if "valid" in dataset:
-        trainer_arguments_kws.setdefault("eval_strategy", "epoch")
+        trainer_arguments_kws.setdefault("evaluation_strategy", "epoch")
         eval_dataset = dataset["valid"]
     else:
         eval_n = min(500, len(dataset["test"]))
