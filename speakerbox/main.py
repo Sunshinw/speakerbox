@@ -40,7 +40,7 @@ EVAL_RESULTS_TEMPLATE = """
 DEFAULT_TRAINER_ARGUMENTS_ARGS = {
     "eval_strategy": "epoch",
     "save_strategy": "steps",
-    "save_steps": 100,
+    "save_steps": 200,
     "learning_rate": 3e-5,
     "per_device_train_batch_size": 8,
     "gradient_accumulation_steps": 1,
@@ -322,15 +322,6 @@ def train(
     if use_cpu:
         trainer_arguments_kws["no_cuda"] = True
 
-    # ---- Recommended defaults for Mac/MPS stability ----
-    # (keep user's values if already provided)
-    trainer_arguments_kws.setdefault("remove_unused_columns", False)
-    trainer_arguments_kws.setdefault("dataloader_pin_memory", False)  # MPS doesn't benefit
-    trainer_arguments_kws.setdefault("dataloader_num_workers", 0)
-    trainer_arguments_kws.setdefault("logging_strategy", "steps")
-    trainer_arguments_kws.setdefault("logging_steps", 100)
-    # ---------------------------------------------------
-
     # Load feature extractor
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_base)
     
@@ -356,16 +347,8 @@ def train(
         "audio", Audio(sampling_rate=feature_extractor.sampling_rate, decode=False)
     )
 
-    # Select eval split first
-    if "valid" in dataset:
-        trainer_arguments_kws.setdefault("eval_strategy", "epoch")
-        eval_dataset = dataset["valid"]
-    else:
-        eval_n = min(500, len(dataset["test"]))
-        eval_dataset = dataset["test"].shuffle(seed=0).select(range(eval_n))
-
     # Precompute eval features
-    eval_dataset = eval_dataset.map(
+    eval_dataset = dataset["valid"].map(
         preprocess_function,
         batched=True,
         batch_size=32,
@@ -411,7 +394,7 @@ def train(
     torch.cuda.empty_cache()
 
     transformers.logging.set_verbosity_info()
-    trainer.train(resume_from_checkpoint=True)
+    trainer.train(resume_from_checkpoint=False)
     trainer.save_model()
     feature_extractor.save_pretrained(model_name)
 

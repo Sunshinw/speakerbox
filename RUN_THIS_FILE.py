@@ -73,7 +73,6 @@ def main():
         max_duration=3.0,
         trainer_arguments_kws={
             "save_strategy": "steps",
-            "save_steps": 100,  
             "gradient_accumulation_steps": 2,
             "per_device_train_batch_size": 8,
             "num_train_epochs": 10,
