@@ -347,8 +347,16 @@ def train(
         "audio", Audio(sampling_rate=feature_extractor.sampling_rate, decode=False)
     )
 
+    # Select eval split first
+    if "valid" in dataset:
+        eval_dataset = dataset["valid"].shuffle(seed=42).select(range(min(500, len(dataset["valid"]))))
+        log.info(f"Sub-sampling validation set to {len(eval_dataset)} examples for speed.")
+    else:
+        eval_n = min(500, len(dataset["test"]))
+        eval_dataset = dataset["test"].shuffle(seed=0).select(range(eval_n))
+
     # Precompute eval features
-    eval_dataset = dataset["valid"].map(
+    eval_dataset = eval_dataset.map(
         preprocess_function,
         batched=True,
         batch_size=32,
@@ -359,9 +367,35 @@ def train(
     )
     eval_dataset.set_format("torch", columns=["input_values", "label"])
 
+    # args = TrainingArguments(
+    #     output_dir=model_name,
+    #     **trainer_arguments_kws,
+    # )
+    
     args = TrainingArguments(
         output_dir=model_name,
-        **trainer_arguments_kws,
+        learning_rate=3e-5,
+        num_train_epochs=10,             
+        
+        use_mps_device=True,            
+        fp16=False,                      
+        bf16=False,                      
+        dataloader_num_workers=0,        
+        dataloader_pin_memory=False,     
+
+        eval_strategy="epoch",
+        per_device_eval_batch_size=4,    
+        eval_accumulation_steps=1,       
+
+        per_device_train_batch_size=4,   
+        gradient_accumulation_steps=4,   # Effective batch size = 16
+        logging_steps=10,
+        save_strategy="steps",           # Save once per epoch for your archive folders
+        save_steps=200,
+        save_total_limit=3,
+        load_best_model_at_end=True,
+        metric_for_best_model="accuracy",
+        report_to="none",
     )
 
     # Metrics
