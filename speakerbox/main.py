@@ -136,22 +136,29 @@ import shutil
 
 class EpochArchiveCallback(TrainerCallback):
     """
-    Saves a dedicated copy of the model in a new folder at the end of each epoch.
+    Saves and EVALUATES a dedicated copy of the model at the end of each epoch.
     """
+    def __init__(self, validation_dataset, feature_extractor):
+        self.validation_dataset = validation_dataset
+        self.fe = feature_extractor # 🚀 Store the extractor here
+
     def on_epoch_end(self, args, state, control, **kwargs):
         epoch_num = round(state.epoch)
-        # Define a unique folder name for this epoch
-        archive_path = Path(args.output_dir) / f"archive_epoch_{epoch_num}"
+        archive_path = Path(args.output_dir) / f"final_speakerbox_epoch_{epoch_num}"
         
         log.info(f"Archiving model at end of epoch {epoch_num} to {archive_path}")
         
-        # Save the model and feature extractor specifically to this folder
+        # 1. Save the model weights and config
         kwargs['model'].save_pretrained(archive_path)
-        if 'processing_class' in kwargs: # for newer transformers
-            kwargs['processing_class'].save_pretrained(archive_path)
-        elif 'feature_extractor' in kwargs:
-            kwargs['feature_extractor'].save_pretrained(archive_path)
+        
+        # 2. 🔥 THE FIX: Save the missing preprocessor_config.json
+        # Without this, the pipeline() call in eval_model will crash.
+        self.fe.save_pretrained(archive_path)
 
+        # 3. Now run your custom evaluation
+        from speakerbox import eval_model
+        eval_model(self.validation_dataset, model_name=str(archive_path))
+        
 def eval_model(
     validation_dataset: "Dataset",
     model_name: str = "trained-speakerbox",
@@ -183,6 +190,7 @@ def eval_model(
     loss: float
         The model log loss as returned by sklearn.metrics.log_loss.
     """
+    import transformers
     import matplotlib.pyplot as plt
     from sklearn.metrics import (
         ConfusionMatrixDisplay,
@@ -191,55 +199,57 @@ def eval_model(
         precision_score,
         recall_score,
     )
-
+    
     log.info("Setting up evaluation pipeline")
+    
+    transformers.logging.set_verbosity_error()
     classifier = pipeline(
         "audio-classification",
         model=model_name,
     )
     log.info("Running eval")
 
-
     import librosa
     import torch
-    import torch.nn.functional as F    
     from typing import Dict, Any
 
     def predict(example: "datasets.arrow_dataset.Example") -> Dict[str, Any]:
-        audio_path = example["audio"]
+        import librosa
+        from typing import Dict, Any
+
+        raw_audio = example["audio"]
+        audio_path = raw_audio["path"] if isinstance(raw_audio, dict) else raw_audio
+        
         speech, _ = librosa.load(audio_path, sr=classifier.feature_extractor.sampling_rate)
         
-        # Get total labels from config
         label2id = classifier.model.config.label2id
+        id2label = classifier.model.config.id2label
         num_labels = len(label2id)
         
-        # Get predictions from pipeline
         pred = classifier(speech, top_k=num_labels)
         
-        # CRITICAL: Create an empty list of zeros for the full distribution
-        # This ensures every speaker has a slot, even if the model gave it 0.0
         prob_list = [0.0] * num_labels
-        
         for item in pred:
             label_str = item["label"]
             score = item["score"]
-            # Use the config's mapping to place the score in the correct index
             idx = int(label2id[label_str])
             prob_list[idx] = score
 
-        # Normalize to ensure sum is exactly 1.0 (prevents sklearn warnings)
-        total = sum(prob_list)
-        prob_list = [p / total for p in prob_list]
+        total_prob = sum(prob_list)
+        prob_list = [p / total_prob for p in prob_list]
+        
+        label_key = str(example["label"])
+        true_label_name = id2label.get(label_key, f"Unknown_{label_key}")
         
         return {
-            "pred_label": pred[0]["label"],
-            "true_label": classifier.model.config.id2label[example["label"]],
+            "pred_label": str(pred[0]["label"]),
+            "true_label": str(true_label_name),
             "pred_scores": prob_list,
-        }
+    }
         
     validation_dataset = validation_dataset.map(predict)
 
-    # Create confusion
+    # 📊 Create confusion matrix for your Stage 1 Report
     ConfusionMatrixDisplay.from_predictions(
         validation_dataset["true_label"],
         validation_dataset["pred_label"],
@@ -248,7 +258,9 @@ def eval_model(
     plt.yticks(rotation=45)
     plt.savefig(f"{model_name}/validation-confusion.png", bbox_inches="tight")
 
-    # Compute metrics
+    # --- METRICS CALCULATION ---
+    all_labels = list(classifier.model.config.label2id.keys())
+
     accuracy = accuracy_score(
         y_true=validation_dataset["true_label"],
         y_pred=validation_dataset["pred_label"],
@@ -257,18 +269,23 @@ def eval_model(
         y_true=validation_dataset["true_label"],
         y_pred=validation_dataset["pred_label"],
         average="weighted",
+        zero_division=0 
     )
     recall = recall_score(
         y_true=validation_dataset["true_label"],
         y_pred=validation_dataset["pred_label"],
         average="weighted",
+        zero_division=0 
     )
+    
+    # Provide the 'labels' argument to sync y_true (161) with y_pred (505)
     loss = log_loss(
         y_true=validation_dataset["true_label"],
         y_pred=validation_dataset["pred_scores"],
+        labels=all_labels 
     )
 
-    # Store metrics
+    # Store metrics in results.md for your documentation
     with open(f"{model_name}/results.md", "w") as open_f:
         open_f.write(
             EVAL_RESULTS_TEMPLATE.format(
@@ -347,25 +364,25 @@ def train(
         "audio", Audio(sampling_rate=feature_extractor.sampling_rate, decode=False)
     )
 
-    # Select eval split first
-    if "valid" in dataset:
-        eval_dataset = dataset["valid"].shuffle(seed=42).select(range(min(500, len(dataset["valid"]))))
-        log.info(f"Sub-sampling validation set to {len(eval_dataset)} examples for speed.")
-    else:
-        eval_n = min(500, len(dataset["test"]))
-        eval_dataset = dataset["test"].shuffle(seed=0).select(range(eval_n))
+    # # Select eval split first
+    # if "valid" in dataset:
+    #     eval_dataset = dataset["valid"].shuffle(seed=42).select(range(min(500, len(dataset["valid"]))))
+    #     log.info(f"Sub-sampling validation set to {len(eval_dataset)} examples for speed.")
+    # else:
+    #     eval_n = min(500, len(dataset["test"]))
+    #     eval_dataset = dataset["test"].shuffle(seed=0).select(range(eval_n))
 
-    # Precompute eval features
-    eval_dataset = eval_dataset.map(
-        preprocess_function,
-        batched=True,
-        batch_size=32,
-        fn_kwargs={
-            "feature_extractor": feature_extractor,
-            "max_duration": max_duration,
-        },
-    )
-    eval_dataset.set_format("torch", columns=["input_values", "label"])
+    # # Precompute eval features
+    # eval_dataset = eval_dataset.map(
+    #     preprocess_function,
+    #     batched=True,
+    #     batch_size=32,
+    #     fn_kwargs={
+    #         "feature_extractor": feature_extractor,
+    #         "max_duration": max_duration,
+    #     },
+    # )
+    # eval_dataset.set_format("torch", columns=["input_values", "label"])
 
     # args = TrainingArguments(
     #     output_dir=model_name,
@@ -381,17 +398,18 @@ def train(
         fp16=False,                      
         bf16=False,                      
         dataloader_num_workers=0,        
-        dataloader_pin_memory=False,     
-
-        eval_strategy="epoch",
-        per_device_eval_batch_size=4,    
-        eval_accumulation_steps=1,       
+        dataloader_pin_memory=False,   
+          
+        eval_strategy="no",
+        # eval_strategy="epoch",
+        # per_device_eval_batch_size=4,    
+        # eval_accumulation_steps=1,       
 
         per_device_train_batch_size=4,   
         gradient_accumulation_steps=4,   # Effective batch size = 16
         logging_steps=10,
         save_strategy="steps",           # Save once per epoch for your archive folders
-        save_steps=200,
+        save_steps=100,
         save_total_limit=3,
         load_best_model_at_end=True,
         metric_for_best_model="accuracy",
@@ -411,15 +429,20 @@ def train(
 
     data_collator = LazyAudioCollator(feature_extractor, max_duration)
 
+    archive_eval_callback = EpochArchiveCallback(
+        validation_dataset=dataset["valid"], 
+        feature_extractor=feature_extractor
+    )
+
     # Train
     trainer = Trainer(
         model=model,
         args=args,
         train_dataset=dataset["train"],
-        eval_dataset=eval_dataset, # ✅ Now uses 10% valid split
+        # eval_dataset=eval_dataset, # ✅ Now uses 10% valid split
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        callbacks=[EpochArchiveCallback()],
+        callbacks=[archive_eval_callback], 
     )
     
      # Optional: reduce MPS fragmentation risk
