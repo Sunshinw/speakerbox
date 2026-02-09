@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 # VCTK_ROOT = "/Users/pakap/Documents/Senior/Code/ECAPA_Libri/VCTK_WAV"
-VCTK_ROOT = "/Users/pakap/Documents/Senior/Code/ECAPA_TDNN/Dataset/libri500_WAV"
+VCTK_ROOT = "/Users/pakap/Documents/Senior/Code/Dataset/libri500_WAV"
 # VCTK_ROOT = ""
 OUTPUT_MODEL_NAME = "exps/libri500"
 MIN_FILES = 1
