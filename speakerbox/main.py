@@ -73,26 +73,24 @@ class LazyAudioCollator:
             audio_data = f.get("audio")
             path = None
             
-            # Extract path from dictionary or string safely
             if isinstance(audio_data, dict):
                 path = audio_data.get("path")
             elif audio_data is not None:
                 path = str(audio_data)
             
-            # Only add to the batch if we actually found a file path
             if path:
                 paths.append(path)
                 valid_labels.append(f["label"])
-            else:
-                log.warning(f"Skipping empty audio path for speaker {f.get('label')}")
+
+        # 🚨 FALLBACK: Prevent self.fe([]) from causing IndexError
+        if not paths:
+            raise ValueError(
+                "LazyAudioCollator received a batch with NO audio paths. "
+                "Check if 'remove_unused_columns=False' is set in TrainingArguments."
+            )
 
         labels = torch.tensor(valid_labels, dtype=torch.long)
-
-        audio_arrays: List[np.ndarray] = []
-        for p in paths:
-            # sf.read is faster than librosa for raw loading on macOS
-            wav, _ = sf.read(p)
-            audio_arrays.append(wav)
+        audio_arrays = [sf.read(p)[0] for p in paths]
 
         batch = self.fe(
             audio_arrays,
@@ -399,6 +397,7 @@ def train(
         bf16=False,                      
         dataloader_num_workers=0,        
         dataloader_pin_memory=False,   
+        remove_unused_columns=False,
           
         eval_strategy="no",
         # eval_strategy="epoch",
