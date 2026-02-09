@@ -411,9 +411,9 @@ def train(
         save_strategy="steps",           # Save once per epoch for your archive folders
         save_steps=100,
         save_total_limit=3,
-        load_best_model_at_end=True,
-        metric_for_best_model="accuracy",
-        report_to="none",
+        # load_best_model_at_end=True,
+        # metric_for_best_model="accuracy",
+        # report_to="none",
     )
 
     # Metrics
