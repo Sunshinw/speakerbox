@@ -408,7 +408,7 @@ def train(
         gradient_accumulation_steps=4,   # Effective batch size = 16
         logging_steps=10,
         save_strategy="steps",           # Save once per epoch for your archive folders
-        save_steps=100,
+        save_steps=500,
         save_total_limit=3,
         # load_best_model_at_end=True,
         # metric_for_best_model="accuracy",
@@ -450,7 +450,7 @@ def train(
     torch.cuda.empty_cache()
 
     transformers.logging.set_verbosity_info()
-    trainer.train(resume_from_checkpoint=False)
+    trainer.train(resume_from_checkpoint=True)
     trainer.save_model()
     feature_extractor.save_pretrained(model_name)
 
