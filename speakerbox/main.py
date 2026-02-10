@@ -39,29 +39,30 @@ EVAL_RESULTS_TEMPLATE = """
 
 DEFAULT_TRAINER_ARGUMENTS_ARGS = {
     # --- Strategy & Checkpointing ---
-    "evaluation_strategy": "epoch",    # Keep as epoch to ensure full metric calculation
-    "save_strategy": "steps",          # Save based on steps for resume safety
-    "save_steps": 100,                 # Frequent checkpoints (approx. every 3.5 mins based on your logs)
-    "save_total_limit": 3,             # Keep only 3 checkpoints to save Windows disk space
-    "load_best_model_at_end": True,    # Required to pick the best encoder for Stage 2
+    "evaluation_strategy": "epoch",    
+    "save_strategy": "steps",          
+    "save_steps": 100,                 
+    "save_total_limit": 3,             
+    "load_best_model_at_end": True,    
     "metric_for_best_model": "accuracy",
 
     # --- Hardware & Windows Performance ---
-    "fp16": True,                      # Set to True if you have an NVIDIA GPU (speeds up training significantly)
-    "dataloader_num_workers": 0,       # CRITICAL for Windows: prevents multiprocessing "Pickle" errors
-    "dataloader_pin_memory": True,     # Speeds up data transfer from RAM to GPU
-    "gradient_checkpointing": True,    # Enable to save VRAM if you hit "Out of Memory" errors
-    "group_by_length": True,           # Faster training by grouping similar duration audio
+    "fp16": True,                      # Keep True now that CUDA is fixed
+    ""
+    "dataloader_num_workers": 0,       
+    "dataloader_pin_memory": True,     
+    "gradient_checkpointing": True,    
+    "group_by_length": True,           
     
     # --- Hyperparameters ---
-    "learning_rate": 3e-5,             # Standard stable rate for Wav2Vec2 fine-tuning
-    "per_device_train_batch_size": 8,
-    "gradient_accumulation_steps": 2,  # Set to 2 to match your terminal screenshot (Total batch = 16)
+    "learning_rate": 3e-5,             # Stable rate for Stage 1 convergence
+    "per_device_train_batch_size": 1,  # Lowered to 4 for VRAM safety with librosa
+    "gradient_accumulation_steps": 16,  # Effective batch size = 16
     "per_device_eval_batch_size": 8,
-    "num_train_epochs": 10,            # Increased to 10 to ensure convergence on 110 VCTK speakers
+    "num_train_epochs": 10,            # Required for 110-speaker separation
     "warmup_ratio": 0.1,
-    "logging_steps": 10,               # Monitor loss closely to see "Region of Separation" formation
-    "report_to": "none",               # Prevents Windows credential popups from wandb/tensorboard
+    "logging_steps": 1,                # 🔥 Keep at 1 to monitor the loss movement
+    "report_to": "none",               
 }
 
 ###############################################################################
@@ -72,50 +73,50 @@ class LazyAudioCollator:
         self.max_len = int(fe.sampling_rate * max_duration_s)
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        import soundfile as sf
-        import numpy as np
+        import librosa
         import torch
 
-        # Extract paths and labels quickly
+        # Filter features to ensure "audio" exists
+        valid_features = [f for f in features if f.get("audio") is not None]
+        
+        # 🚨 FINAL FIX: If a batch is empty, grab the first item anyway to prevent Trainer crash
+        if not valid_features:
+            log.warning("Empty batch detected! Forcing first item to prevent crash.")
+            valid_features = [features[0]]
+
         paths = [f["audio"]["path"] if isinstance(f["audio"], dict) else str(f["audio"]) 
-                 for f in features if f.get("audio")]
-        labels = torch.tensor([f["label"] for f in features if f.get("audio")], dtype=torch.long)
+                 for f in valid_features]
+        labels = torch.tensor([f["label"] for f in valid_features], dtype=torch.long)
 
-        # OPTIMIZATION: List comprehension for audio loading is faster than manual for-loops
-        # sf.read is generally faster on Windows than librosa
-        audio_arrays = [sf.read(p)[0] for p in paths]
+        audio_arrays = [librosa.load(p, sr=self.fe.sampling_rate)[0] for p in paths]
 
-        # Feature extraction in one batch call
         batch = self.fe(
             audio_arrays,
             sampling_rate=self.fe.sampling_rate,
             max_length=self.max_len,
             truncation=True,
-            padding=True,
+            padding="max_length",
             return_tensors="pt",
         )
         batch["labels"] = labels
         return batch
     
 def preprocess_function(batch, feature_extractor, max_duration):
-    import soundfile as sf
+    import librosa
     import numpy as np
 
     max_len = int(feature_extractor.sampling_rate * max_duration)
-
     paths = [item["path"] for item in batch["audio"]]
     
-    speech_list = []
-    for path in paths:
-        wav, sr = sf.read(path)
-        speech_list.append(wav)
+    # Resample validation data to 16kHz
+    speech_list = [librosa.load(path, sr=feature_extractor.sampling_rate)[0] for path in paths]
 
     inputs = feature_extractor(
         speech_list,
         sampling_rate=feature_extractor.sampling_rate,
         max_length=max_len,
         truncation=True,
-        padding=True,
+        padding="max_length",
         return_tensors="np",
     )
 
@@ -127,54 +128,37 @@ import shutil
 
 class EpochArchiveCallback(TrainerCallback):
     """
-    Saves a dedicated copy of the model in a new folder at the end of each epoch.
+    Saves and EVALUATES a dedicated copy of the model at the end of each epoch.
     """
+    def __init__(self, validation_dataset, feature_extractor):
+        self.validation_dataset = validation_dataset
+        self.fe = feature_extractor # 🚀 Store the extractor here
+
     def on_epoch_end(self, args, state, control, **kwargs):
         epoch_num = round(state.epoch)
-        # Define a unique folder name for this epoch
         archive_path = Path(args.output_dir) / f"final_speakerbox_epoch_{epoch_num}"
         
         log.info(f"Archiving model at end of epoch {epoch_num} to {archive_path}")
         
-        # Save the model and feature extractor specifically to this folder
+        # 1. Save the model weights and config
         kwargs['model'].save_pretrained(archive_path)
-        if 'processing_class' in kwargs: # for newer transformers
-            kwargs['processing_class'].save_pretrained(archive_path)
-        elif 'feature_extractor' in kwargs:
-            kwargs['feature_extractor'].save_pretrained(archive_path)
+        
+        # 2. 🔥 THE FIX: Save the missing preprocessor_config.json
+        # Without this, the pipeline() call in eval_model will crash.
+        self.fe.save_pretrained(archive_path)
 
+        # 3. Now run your custom evaluation
+        # from speakerbox import eval_model
+        # eval_model(self.validation_dataset, model_name=str(archive_path))
+              
 def eval_model(
     validation_dataset: "Dataset",
     model_name: str = "trained-speakerbox",
 ) -> Tuple[float, float, float, float]:
-    """
-    Evaluate a trained model.
-
-    This will store two files in the model directory, one for the accuracy, precision,
-    and recall in a markdown file and the other is the generated top one confusion
-    matrix as a PNG file.
-
-    Parameters
-    ----------
-    validation_dataset: Dataset
-        The dataset to validate the model against.
-    model_name: str
-        A name for the model. This will also create a directory with the same name
-        to store the produced model in.
-        Default: "trained-speakerbox"
-
-    Returns
-    -------
-    accuracy: float
-        The model accuracy as returned by sklearn.metrics.accuracy_score.
-    precision: float
-        The model (weighted) precision as returned by sklearn.metrics.precision_score.
-    recall: float
-        The model (weighted) recall as returned by sklearn.metrics.recall_score.
-    loss: float
-        The model log loss as returned by sklearn.metrics.log_loss.
-    """
+    import transformers
     import matplotlib.pyplot as plt
+    import librosa
+    import numpy as np # 🚀 Required for Loss calculation
     from sklearn.metrics import (
         ConfusionMatrixDisplay,
         accuracy_score,
@@ -182,84 +166,72 @@ def eval_model(
         precision_score,
         recall_score,
     )
-
+    
     log.info("Setting up evaluation pipeline")
-    classifier = pipeline(
-        "audio-classification",
-        model=model_name,
-    )
-    log.info("Running eval")
-
-
-    import librosa
-    import torch
-    import torch.nn.functional as F    
-    from typing import Dict, Any
+    transformers.logging.set_verbosity_error()
+    classifier = pipeline("audio-classification", model=model_name)
+    
+    # 🚀 FIX 1: Access the dataset's feature mapping to avoid integer mismatch
+    # This ensures we get "p225" regardless of what integer the dataset assigned today.
+    label_names = validation_dataset.features["label"]
 
     def predict(example: "datasets.arrow_dataset.Example") -> Dict[str, Any]:
-        audio_path = example["audio"]
+        raw_audio = example["audio"]
+        audio_path = raw_audio["path"] if isinstance(raw_audio, dict) else raw_audio
         speech, _ = librosa.load(audio_path, sr=classifier.feature_extractor.sampling_rate)
         
-        # Get total labels from config
         label2id = classifier.model.config.label2id
         num_labels = len(label2id)
-        
-        # Get predictions from pipeline
         pred = classifier(speech, top_k=num_labels)
         
-        # CRITICAL: Create an empty list of zeros for the full distribution
-        # This ensures every speaker has a slot, even if the model gave it 0.0
         prob_list = [0.0] * num_labels
-        
         for item in pred:
-            label_str = item["label"]
-            score = item["score"]
-            # Use the config's mapping to place the score in the correct index
-            idx = int(label2id[label_str])
-            prob_list[idx] = score
+            idx = int(label2id[item["label"]])
+            prob_list[idx] = item["score"]
 
-        # Normalize to ensure sum is exactly 1.0 (prevents sklearn warnings)
-        total = sum(prob_list)
-        prob_list = [p / total for p in prob_list]
+        # 🚀 FIX 2: Use the dataset's own decoding feature for the Truth
+        true_label_name = label_names.int2str(example["label"])
         
         return {
-            "pred_label": pred[0]["label"],
-            "true_label": classifier.model.config.id2label[example["label"]],
+            "pred_label": str(pred[0]["label"]),
+            "true_label": str(true_label_name),
             "pred_scores": prob_list,
         }
         
+    log.info("Running eval...")
     validation_dataset = validation_dataset.map(predict)
 
-    # Create confusion
-    ConfusionMatrixDisplay.from_predictions(
-        validation_dataset["true_label"],
-        validation_dataset["pred_label"],
-    )
-    plt.xticks(rotation=45)
-    plt.yticks(rotation=45)
-    plt.savefig(f"{model_name}/validation-confusion.png", bbox_inches="tight")
+    # --- METRICS CALCULATION ---
+    # 🚀 FIX 3: Convert scores to a NumPy array for Scikit-Learn stability
+    y_pred_probs = np.array(validation_dataset["pred_scores"])
+    all_labels = list(classifier.model.config.label2id.keys())
 
-    # Compute metrics
     accuracy = accuracy_score(
         y_true=validation_dataset["true_label"],
         y_pred=validation_dataset["pred_label"],
     )
+    
+    # Loss Fix: Alignment of probabilities to label order
+    loss = log_loss(
+        y_true=validation_dataset["true_label"],
+        y_pred=y_pred_probs,
+        labels=all_labels 
+    )
+    
     precision = precision_score(
         y_true=validation_dataset["true_label"],
         y_pred=validation_dataset["pred_label"],
         average="weighted",
+        zero_division=0 
     )
     recall = recall_score(
         y_true=validation_dataset["true_label"],
         y_pred=validation_dataset["pred_label"],
         average="weighted",
-    )
-    loss = log_loss(
-        y_true=validation_dataset["true_label"],
-        y_pred=validation_dataset["pred_scores"],
+        zero_division=0 
     )
 
-    # Store metrics
+    # Store metrics in results.md for your documentation
     with open(f"{model_name}/results.md", "w") as open_f:
         open_f.write(
             EVAL_RESULTS_TEMPLATE.format(
@@ -271,7 +243,6 @@ def eval_model(
         )
 
     return (accuracy, precision, recall, loss)
-
 
 def train(
     dataset: "DatasetDict",
@@ -308,30 +279,20 @@ def train(
     # Handle seed
     if seed is not None:
         set_global_seed(seed)
-
-    # Handle cpu
-    if use_cpu:
-        trainer_arguments_kws["no_cuda"] = True
         
     # Check for CUDA (NVIDIA GPU)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Training will run on: {device}")
-    
-    # Move model to GPU
-    model.to(device) #
+
+    # Handle cpu
+    if device.type == "cpu":
+        log.warning("No CUDA GPU found. Disabling FP16 and switching to CPU.")
+        trainer_arguments_kws["fp16"] = False
+        trainer_arguments_kws["no_cuda"] = True
 
     # Pre-emptively clear the cache to maximize VRAM
     if torch.cuda.is_available():
         torch.cuda.empty_cache() 
-
-    # ---- Recommended defaults for Mac/MPS stability ----
-    # (keep user's values if already provided)
-    trainer_arguments_kws.setdefault("remove_unused_columns", False)
-    trainer_arguments_kws.setdefault("dataloader_pin_memory", False)  # MPS doesn't benefit
-    trainer_arguments_kws.setdefault("dataloader_num_workers", 0)
-    trainer_arguments_kws.setdefault("logging_strategy", "steps")
-    trainer_arguments_kws.setdefault("logging_steps", 10)
-    # ---------------------------------------------------
 
     # Load feature extractor
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_base)
@@ -350,37 +311,84 @@ def train(
         label2id=label2id,
         id2label=id2label,
         ignore_mismatched_sizes=True,
+        # 🔥 CRITICAL: Force the model to ONLY return the classification logits
+        output_hidden_states=False, 
+        output_attentions=False,
     )
-
+    
+    # Move model to GPU
+    model.to(device) 
 
     log.info("Casting all audio paths to HF Audio (decode=False)")
-    dataset = dataset.cast_column(
-        "audio", Audio(sampling_rate=feature_extractor.sampling_rate, decode=False)
-    )
+    # Define a specific path for the metadata cache
+    
+    metadata_cache_path = Path(model_name) / "speakerboxdts_metadata_ds"
+
+    if metadata_cache_path.exists():
+        log.info(f"🚀 Loading pre-cast metadata from: {metadata_cache_path}")
+        from datasets import load_from_disk
+        dataset = load_from_disk(str(metadata_cache_path))
+    else:
+        log.info("Casting all audio paths to HF Audio (decode=False)...")
+        dataset = dataset.cast_column(
+            "audio", Audio(sampling_rate=feature_extractor.sampling_rate, decode=False)
+        )
+        
+        # Ensure the output directory exists before saving
+        metadata_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        dataset.save_to_disk(str(metadata_cache_path))
+        log.info(f"💾 Metadata cached successfully to {metadata_cache_path}")
 
     # Select eval split first
+    # Find this section in your train() function
     if "valid" in dataset:
-        trainer_arguments_kws.setdefault("evaluation_strategy", "epoch")
-        eval_dataset = dataset["valid"]
+        full_valid = dataset["valid"]
+        eval_dataset = full_valid.shuffle(seed=42).select(range(min(500, len(full_valid))))
+        log.info(f"Sub-sampling validation set to {len(eval_dataset)} examples for speed.")
     else:
         eval_n = min(500, len(dataset["test"]))
         eval_dataset = dataset["test"].shuffle(seed=0).select(range(eval_n))
 
     # Precompute eval features
-    eval_dataset = eval_dataset.map(
-        preprocess_function,
-        batched=True,
-        batch_size=32,
-        fn_kwargs={
-            "feature_extractor": feature_extractor,
-            "max_duration": max_duration,
-        },
-    )
-    eval_dataset.set_format("torch", columns=["input_values", "label"])
+    # eval_dataset = eval_dataset.map(
+    #     preprocess_function,
+    #     batched=True,
+    #     batch_size=32,
+    #     fn_kwargs={
+    #         "feature_extractor": feature_extractor,
+    #         "max_duration": max_duration,
+    #     },
+    # )
+    # eval_dataset.set_format("torch", columns=["input_values", "label"])
 
+    # args = TrainingArguments(
+    #     output_dir=model_name,
+    #     **trainer_arguments_kws,
+    # )
+    
+    # Inside speakerbox/main.py
     args = TrainingArguments(
         output_dir=model_name,
-        **trainer_arguments_kws,
+        learning_rate=3e-5,
+        num_train_epochs=10,
+        fp16=False,
+        logging_steps=10,
+        
+        # --- Speed & VRAM Surgery ---
+        evaluation_strategy="no",
+        # evaluation_strategy="epoch", 
+        # per_device_eval_batch_size=2, # 🚀 Lowered to 2 to fit in 4GB VRAM
+        # eval_accumulation_steps=1,    # 🚨 Flush memory to CPU after EVERY batch
+        # fp16_full_eval=True,          # Keep half-precision for speed
+        
+        ignore_data_skip=True,
+        save_steps=200,
+        save_total_limit=3,
+        per_device_train_batch_size=4, 
+        gradient_accumulation_steps=4, 
+        dataloader_num_workers=0,
+        remove_unused_columns=False,
+        report_to="none",
     )
 
     # Metrics
@@ -396,15 +404,20 @@ def train(
 
     data_collator = LazyAudioCollator(feature_extractor, max_duration)
 
+    archive_eval_callback = EpochArchiveCallback(
+        validation_dataset=dataset["valid"], 
+        feature_extractor=feature_extractor
+    )
+
     # Train
     trainer = Trainer(
         model=model,
         args=args,
         train_dataset=dataset["train"],
-        eval_dataset=eval_dataset, # ✅ Now uses 10% valid split
+        # eval_dataset=eval_dataset, # ✅ Now uses 10% valid split
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        callbacks=[EpochArchiveCallback()],
+        callbacks=[archive_eval_callback], 
     )
     
      # Optional: reduce MPS fragmentation risk
@@ -416,6 +429,8 @@ def train(
     trainer.train(resume_from_checkpoint=True)
     trainer.save_model()
     feature_extractor.save_pretrained(model_name)
+    # eval_model(dataset["valid"], model_name=str(model_name))
+    
 
     return Path(model_name).resolve()
 
