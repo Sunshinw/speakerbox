@@ -132,160 +132,214 @@ def preprocess_function(batch, feature_extractor, max_duration):
 from transformers import TrainerCallback
 import shutil
 
+from transformers import TrainerCallback
+from pathlib import Path
+import shutil
+import os
+
 class EpochArchiveCallback(TrainerCallback):
     """
-    Saves and EVALUATES a dedicated copy of the model at the end of each epoch.
+    At epoch end:
+    - finds the latest HF checkpoint in output_dir
+    - copies it into final_speakerbox_epoch_{epoch}
+    - saves feature extractor into it
+    - optionally runs eval on it
     """
-    def __init__(self, validation_dataset, feature_extractor):
+
+    def __init__(self, validation_dataset, feature_extractor, run_eval: bool = True):
         self.validation_dataset = validation_dataset
-        self.fe = feature_extractor # 🚀 Store the extractor here
+        self.fe = feature_extractor
+        self.run_eval = run_eval
 
     def on_epoch_end(self, args, state, control, **kwargs):
-        epoch_num = round(state.epoch)
-        archive_path = Path(args.output_dir) / f"final_speakerbox_epoch_{epoch_num}"
-        
-        log.info(f"Archiving model at end of epoch {epoch_num} to {archive_path}")
-        
-        # 1. Save the model weights and config
-        kwargs['model'].save_pretrained(archive_path)
-        
-        # 2. 🔥 THE FIX: Save the missing preprocessor_config.json
-        # Without this, the pipeline() call in eval_model will crash.
+        epoch_num = int(round(state.epoch))
+        output_dir = Path(args.output_dir)
+
+        archive_path = output_dir / f"final_speakerbox_epoch_{epoch_num}"
+        log.info(f"Archiving FULL checkpoint at end of epoch {epoch_num} to {archive_path}")
+
+        # ------------------------------------------------------------
+        # 1) Find the most recent checkpoint saved by Trainer
+        # ------------------------------------------------------------
+        checkpoints = sorted(output_dir.glob("checkpoint-*"), key=lambda p: p.stat().st_mtime)
+
+        if not checkpoints:
+            log.warning("No checkpoint-* folder found yet. Skipping archive.")
+            return control
+
+        latest_ckpt = checkpoints[-1]
+
+        # ------------------------------------------------------------
+        # 2) Copy it to archive folder
+        # ------------------------------------------------------------
+        if archive_path.exists():
+            shutil.rmtree(archive_path)
+
+        shutil.copytree(latest_ckpt, archive_path)
+
+        # ------------------------------------------------------------
+        # 3) Save feature extractor into the archive folder
+        # ------------------------------------------------------------
         self.fe.save_pretrained(archive_path)
 
-        # 3. Now run your custom evaluation
-        from speakerbox import eval_model
-        eval_model(self.validation_dataset, model_name=str(archive_path))
-        
-def eval_model(
-    validation_dataset: "Dataset",
-    model_name: str = "trained-speakerbox",
-) -> Tuple[float, float, float, float]:
-    """
-    Evaluate a trained model.
+        # ------------------------------------------------------------
+        # 4) Optional: run evaluation
+        # ------------------------------------------------------------
+        if self.run_eval:
+            from speakerbox.main import eval_model
+            eval_model(self.validation_dataset, model_name=str(archive_path))
 
-    This will store two files in the model directory, one for the accuracy, precision,
-    and recall in a markdown file and the other is the generated top one confusion
-    matrix as a PNG file.
+        return control
 
-    Parameters
-    ----------
-    validation_dataset: Dataset
-        The dataset to validate the model against.
-    model_name: str
-        A name for the model. This will also create a directory with the same name
-        to store the produced model in.
-        Default: "trained-speakerbox"
+def eval_model(validation_dataset, model_name: str):
+    import os
+    import numpy as np
+    import torch
+    import soundfile as sf
 
-    Returns
-    -------
-    accuracy: float
-        The model accuracy as returned by sklearn.metrics.accuracy_score.
-    precision: float
-        The model (weighted) precision as returned by sklearn.metrics.precision_score.
-    recall: float
-        The model (weighted) recall as returned by sklearn.metrics.recall_score.
-    loss: float
-        The model log loss as returned by sklearn.metrics.log_loss.
-    """
+    from transformers import (
+        Wav2Vec2ForSequenceClassification,
+        Wav2Vec2FeatureExtractor,
+    )
+
     import transformers
-    import matplotlib.pyplot as plt
     from sklearn.metrics import (
-        ConfusionMatrixDisplay,
         accuracy_score,
-        log_loss,
         precision_score,
         recall_score,
+        log_loss,
     )
-    
-    log.info("Setting up evaluation pipeline")
-    
+
     transformers.logging.set_verbosity_error()
-    classifier = pipeline(
-        "audio-classification",
-        model=model_name,
-    )
-    log.info("Running eval")
 
-    import librosa
-    import torch
-    from typing import Dict, Any
+    log.info("Setting up evaluation model + feature extractor (NO pipeline)")
 
-    def predict(example: "datasets.arrow_dataset.Example") -> Dict[str, Any]:
-        import librosa
-        from typing import Dict, Any
+    # -------------------------
+    # device
+    # -------------------------
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
-        raw_audio = example["audio"]
-        audio_path = raw_audio["path"] if isinstance(raw_audio, dict) else raw_audio
-        
-        speech, _ = librosa.load(audio_path, sr=classifier.feature_extractor.sampling_rate)
-        
-        label2id = classifier.model.config.label2id
-        id2label = classifier.model.config.id2label
-        num_labels = len(label2id)
-        
-        pred = classifier(speech, top_k=num_labels)
-        
-        prob_list = [0.0] * num_labels
-        for item in pred:
-            label_str = item["label"]
-            score = item["score"]
-            idx = int(label2id[label_str])
-            prob_list[idx] = score
+    # -------------------------
+    # load model + extractor
+    # -------------------------
+    model = Wav2Vec2ForSequenceClassification.from_pretrained(model_name).to(device)
+    model.eval()
 
-        total_prob = sum(prob_list)
-        prob_list = [p / total_prob for p in prob_list]
-        
-        label_key = str(example["label"])
-        true_label_name = id2label.get(label_key, f"Unknown_{label_key}")
-        
+    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
+
+    label2id = model.config.label2id
+    id2label = model.config.id2label
+
+    # IMPORTANT:
+    # log_loss requires labels in fixed order
+    all_labels = list(label2id.keys())
+    num_labels = len(all_labels)
+
+    # -------------------------
+    # audio settings
+    # -------------------------
+    max_duration_s = 2.0
+    max_len = int(feature_extractor.sampling_rate * max_duration_s)
+
+    # -------------------------
+    # check label mismatch
+    # -------------------------
+    dataset_labels = list(validation_dataset.features["label"].names)
+    dataset_label_set = set(dataset_labels)
+    model_label_set = set(all_labels)
+
+    extra_in_dataset = dataset_label_set - model_label_set
+    extra_in_model = model_label_set - dataset_label_set
+
+    log.info(f"Model labels: {len(model_label_set)}")
+    log.info(f"Dataset labels: {len(dataset_label_set)}")
+    log.info(f"Labels in dataset but not model: {len(extra_in_dataset)}")
+    log.info(f"Labels in model but not dataset: {len(extra_in_model)}")
+    # -------------------------
+    # batch prediction
+    # -------------------------
+    @torch.no_grad()
+    def predict_batch(batch):
+        # paths
+        paths = []
+        for audio_obj in batch["audio"]:
+            if isinstance(audio_obj, dict):
+                paths.append(audio_obj["path"])
+            else:
+                paths.append(str(audio_obj))
+
+        # load wavs
+        speech_list = []
+        for p in paths:
+            wav, sr = sf.read(p)
+
+        # feature extraction
+        inputs = feature_extractor(
+            speech_list,
+            sampling_rate=feature_extractor.sampling_rate,
+            max_length=max_len,
+            truncation=True,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        # forward
+        logits = model(**inputs).logits
+        probs = torch.softmax(logits, dim=-1).cpu().numpy()  # shape: (B, num_labels)
+
+        pred_ids = np.argmax(probs, axis=-1)
+
+        # model id -> label name
+        pred_labels = [id2label[int(i)] for i in pred_ids]
+
+        # dataset label id -> label name
+        true_labels = [dataset_labels[x] for x in batch["label"]]
+
         return {
-            "pred_label": str(pred[0]["label"]),
-            "true_label": str(true_label_name),
-            "pred_scores": prob_list,
-    }
-        
-    validation_dataset = validation_dataset.map(predict)
+            "pred_label": pred_labels,
+            "true_label": true_labels,
+            "pred_scores": probs.tolist(),
+        }
 
-    # 📊 Create confusion matrix for your Stage 1 Report
-    ConfusionMatrixDisplay.from_predictions(
-        validation_dataset["true_label"],
-        validation_dataset["pred_label"],
-    )
-    plt.xticks(rotation=45)
-    plt.yticks(rotation=45)
-    plt.savefig(f"{model_name}/validation-confusion.png", bbox_inches="tight")
+    log.info("Running eval map()...")
 
-    # --- METRICS CALCULATION ---
-    all_labels = list(classifier.model.config.label2id.keys())
+    validation_dataset = validation_dataset.map(
+        predict_batch,
+        batched=True,
+        batch_size=16,
+        remove_columns=[],  # keep all original columns
+        load_from_cache_file=False,  # avoids fingerprint hashing warning
+    )
 
-    accuracy = accuracy_score(
-        y_true=validation_dataset["true_label"],
-        y_pred=validation_dataset["pred_label"],
-    )
-    precision = precision_score(
-        y_true=validation_dataset["true_label"],
-        y_pred=validation_dataset["pred_label"],
-        average="weighted",
-        zero_division=0 
-    )
-    recall = recall_score(
-        y_true=validation_dataset["true_label"],
-        y_pred=validation_dataset["pred_label"],
-        average="weighted",
-        zero_division=0 
-    )
-    
-    # Provide the 'labels' argument to sync y_true (161) with y_pred (505)
+    # -------------------------
+    # metrics
+    # -------------------------
+    y_true = validation_dataset["true_label"]
+    y_pred = validation_dataset["pred_label"]
+    y_scores = validation_dataset["pred_scores"]
+
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average="weighted", zero_division=0)
+    recall = recall_score(y_true, y_pred, average="weighted", zero_division=0)
+
+    # log_loss expects y_pred as (N, C) aligned with labels list
     loss = log_loss(
-        y_true=validation_dataset["true_label"],
-        y_pred=validation_dataset["pred_scores"],
-        labels=all_labels 
+        y_true=y_true,
+        y_pred=y_scores,
+        labels=all_labels,
     )
 
-    # Store metrics in results.md for your documentation
-    with open(f"{model_name}/results.md", "w") as open_f:
-        open_f.write(
+    # -------------------------
+    # save results
+    # -------------------------
+    os.makedirs(model_name, exist_ok=True)
+
+    with open(f"{model_name}/results.md", "w") as f:
+        f.write(
             EVAL_RESULTS_TEMPLATE.format(
                 accuracy=accuracy,
                 precision=precision,
@@ -294,7 +348,9 @@ def eval_model(
             )
         )
 
-    return (accuracy, precision, recall, loss)
+    log.info(f"Saved eval results to: {model_name}/results.md")
+
+    return accuracy, precision, recall, loss
 
 
 def train(
