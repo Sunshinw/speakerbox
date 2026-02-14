@@ -192,6 +192,10 @@ def eval_model(
         # 🚀 FIX 2: Use the dataset's own decoding feature for the Truth
         true_label_name = label_names.int2str(example["label"])
         
+        # 🔥 THE VISUALIZATION FIX: Live check for mislabeling
+        match_status = "✅ MATCH" if pred[0]["label"] == true_label_name else "❌ MISMATCH"
+        log.info(f"Truth: {true_label_name} | Pred: {pred[0]['label']} | Status: {match_status}")
+        
         return {
             "pred_label": str(pred[0]["label"]),
             "true_label": str(true_label_name),
@@ -199,6 +203,7 @@ def eval_model(
         }
         
     log.info("Running eval...")
+    # The .map function will now output your match status for every sample in the console.
     validation_dataset = validation_dataset.map(predict)
 
     # --- METRICS CALCULATION ---
@@ -243,7 +248,6 @@ def eval_model(
         )
 
     return (accuracy, precision, recall, loss)
-
 def train(
     dataset: "DatasetDict",
     model_name: str = "trained-speakerbox",
@@ -369,8 +373,8 @@ def train(
     # Inside speakerbox/main.py
     args = TrainingArguments(
         output_dir=model_name,
-        learning_rate=3e-5,
-        num_train_epochs=10,
+        learning_rate=6.202445652173913e-06,
+        num_train_epochs=3,
         fp16=False,
         logging_steps=10,
         

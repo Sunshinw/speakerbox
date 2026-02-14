@@ -146,7 +146,7 @@ def main():
     # )
     
     # Evaluate using the isolated test set
-    metrics = eval_model(dataset["test"], "exps\V")
+    metrics = eval_model(dataset["test"], "exps/v")
     log.info(f"Final Evaluation Results: {metrics}")
 
 if __name__ == "__main__":
