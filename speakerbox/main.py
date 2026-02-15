@@ -180,6 +180,8 @@ class EpochArchiveCallback(TrainerCallback):
         # ------------------------------------------------------------
         # 3) Save feature extractor into the archive folder
         # ------------------------------------------------------------
+        kwargs['model'].save_pretrained(archive_path)
+        
         self.fe.save_pretrained(archive_path)
 
         # ------------------------------------------------------------
