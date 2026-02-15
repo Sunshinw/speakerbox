@@ -237,7 +237,7 @@ def eval_model(validation_dataset, model_name: str):
 
     # IMPORTANT:
     # log_loss requires labels in fixed order
-    all_labels = list(label2id.keys())
+    all_labels = [id2label[i] for i in range(len(id2label))]
     num_labels = len(all_labels)
 
     # -------------------------
@@ -277,6 +277,7 @@ def eval_model(validation_dataset, model_name: str):
         speech_list = []
         for p in paths:
             wav, sr = sf.read(p)
+            speech_list.append(wav)
 
         # feature extraction
         inputs = feature_extractor(
