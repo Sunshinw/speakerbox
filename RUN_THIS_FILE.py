@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 # VCTK_ROOT = "/Users/pakap/Documents/Senior/Code/ECAPA_Libri/VCTK_WAV"
 VCTK_ROOT = "/Users/pakap/Documents/Senior/Code/Dataset/libri500_WAV"
 # VCTK_ROOT = ""
-OUTPUT_MODEL_NAME = "exps/libri500_1"
+OUTPUT_MODEL_NAME = "exps/libri500_model"
 MIN_FILES = 1
 
 def prepare_prod_dataset(root_path: str) -> DatasetDict:
@@ -67,19 +67,19 @@ def main():
     
     print("STARTING PRODUCTION TRAINING")
     
-    # model_path = train(
-    #     dataset=dataset,
-    #     model_name=OUTPUT_MODEL_NAME,
-    #     max_duration=3.0,
-    #     trainer_arguments_kws={
-    #         "save_strategy": "steps",
-    #         "gradient_accumulation_steps": 2,
-    #         "per_device_train_batch_size": 8,
-    #         "num_train_epochs": 10,
-    #         "save_total_limit": 2,
-    #         "fp16": False,
-    #     }
-    # )
+    model_path = train(
+        dataset=dataset,
+        model_name=OUTPUT_MODEL_NAME,
+        max_duration=3.0,
+        trainer_arguments_kws={
+            "save_strategy": "steps",
+            "gradient_accumulation_steps": 2,
+            "per_device_train_batch_size": 8,
+            "num_train_epochs": 10,
+            "save_total_limit": 2,
+            "fp16": False,
+        }
+    )
 
     dataset["test"] = dataset["test"].cast_column("audio", Audio(decode=False))
     metrics = eval_model(dataset["test"], OUTPUT_MODEL_NAME)
