@@ -14,8 +14,8 @@ Works on **Windows (NVIDIA/CUDA)** and **macOS (Apple Silicon/MPS)**.
 ```
 speakerbox/
 ├── main.py            ← model logic (collator, eval, train, apply)
-├── RUN_THIS_FILE.py   ← CLI launcher (dataset prep + argument parsing)
-└── README.md
+RUN_THIS_FILE.py   ← CLI launcher (dataset prep + argument parsing)
+README.md
 ```
 
 ---
@@ -130,23 +130,12 @@ exps/my_model/
 
 | Line | Name | Topic |
 |---|---|---|
-| 1 | *(module docstring)* | Embedded usage examples |
-| 35–44 | imports | argparse, pandas, HF datasets, local `main.py` import via `sys.path` |
+| 1–44 | imports | argparse, pandas, HF datasets, local `main.py` import via `sys.path` |
 | 54 | `def prepare_dataset` | Scans audio folder, derives labels from filename, builds 80/10/10 HF DatasetDict |
-| 76 | *(inside prepare_dataset)* | Shuffle + speaker filter by `min_speaker_files` |
-| 83–96 | *(inside prepare_dataset)* | Train/valid/test split, cast to `Audio(decode=False)`, class-encode labels |
 | 103 | `def cmd_train` | Builds `trainer_args` dict, calls `train()` from `main.py` |
 | 137 | `def cmd_eval` | Casts test split, calls `eval_model()` from `main.py`, logs metrics |
 | 160 | `def build_parser` | Defines all argparse sub-commands and flags |
-| 168–170 | *(inside build_parser)* | Registers `train`, `eval`, `train_eval` sub-commands |
-| 172–193 | *(inside build_parser)* | Shared flags: `--dataset`, `--output`, `--audio-backend`, `--min-speaker-files` |
-| 195–250 | *(inside build_parser)* | Train flags: `--epochs`, `--batch`, `--accum`, `--lr`, `--fp16`, `--save-steps`, `--metadata-cache`, `--seed`, `--resume`/`--no-resume` |
-| 252–265 | *(inside build_parser)* | Eval flags: `--eval-model`, `--eval-mode` |
-| 267–288 | *(inside build_parser)* | `mac` shortcut sub-command with Apple Silicon presets |
-| 290–311 | *(inside build_parser)* | `windows` shortcut sub-command with NVIDIA presets |
 | 320 | `def main` | Dispatches parsed args to `cmd_train`, `cmd_eval`, or both |
-| 324–332 | *(inside main)* | `mac` branch — injects preset values then runs train + eval |
-| 334–342 | *(inside main)* | `windows` branch — injects preset values then runs train + eval |
 
 ---
 
@@ -164,14 +153,14 @@ exps/my_model/
 | 126 | `class EpochArchiveCallback` | HF TrainerCallback that snapshots a complete model at the end of every epoch |
 | 134 | `def __init__` | Stores validation dataset, feature extractor, `run_eval`, `eval_mode`, `audio_backend` |
 | 148 | `def on_epoch_end` | Finds latest `checkpoint-*`, copies to `final_speakerbox_epoch_N`, saves feature extractor, optionally runs `eval_model` |
-| 178 | `def eval_model` | Evaluates a saved model; returns `(accuracy, precision, recall, loss)` and writes `results.md` |
+| 178 | <b> def eval_model <b> | Evaluates a saved model; returns `(accuracy, precision, recall, loss)` and writes `results.md` |
 | 208–242 | *(pipeline branch)* | `eval_mode="pipeline"` — HF pipeline + librosa, one sample at a time; original Windows-style path |
 | 219 | `def _predict_one` | Inner function for pipeline eval — loads audio, runs classifier, aligns scores to label order |
 | 244–301 | *(softmax branch)* | `eval_mode="softmax"` — loads model directly, batched forward pass + `torch.softmax`; mac/MPS-friendly |
 | 268 | `def _predict_batch` | Inner function for softmax eval — loads batch of wavs, runs model, returns pred labels + softmax scores |
 | 303–321 | *(shared metrics)* | `accuracy_score`, `precision_score`, `recall_score`, `log_loss` computed once regardless of eval mode |
 | 327 | `def _find_last_checkpoint` | Globs `checkpoint-*` in output dir, sorts by step number, returns latest path or `None` — prevents crash when no checkpoint exists |
-| 347 | `def train` | Main training entry point — device setup, model init, metadata caching, HF Trainer construction and `.train()` call |
+| 347 | <b> def train <b> | Main training entry point — device setup, model init, metadata caching, HF Trainer construction and `.train()` call |
 | 394–408 | *(inside train)* | Device selection: CUDA → MPS → CPU with automatic fp16/no_cuda adjustment |
 | 411–416 | *(inside train)* | Feature extractor load + `label2id`/`id2label` lookup tables from dataset |
 | 418–428 | *(inside train)* | `Wav2Vec2ForSequenceClassification` loaded from `model_base`, moved to device |
