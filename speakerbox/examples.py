@@ -11,7 +11,7 @@ import pandas as pd
 from dataclasses_json import DataClassJsonMixin
 from tqdm import tqdm
 
-from .main import eval_model, train
+from .main_window import eval_model, train
 from .preprocess import prepare_dataset
 from .utils import set_global_seed
 
