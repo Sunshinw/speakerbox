@@ -1,30 +1,23 @@
 #!/usr/bin/env python
 
 import logging
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
-from transformers import pipeline
-import torch
-import soundfile as sf
 import numpy as np
+import torch
+from transformers import TrainerCallback, pipeline
 
 if TYPE_CHECKING:
     import datasets
-    from datasets import Dataset, DatasetDict, arrow_dataset
-    from datasets import Audio
-    # from evaluate import load as load_metric
+    from datasets import Audio, Dataset, DatasetDict, arrow_dataset
     from pyannote.core.annotation import Annotation
     from transformers import EvalPrediction, feature_extraction_utils
-
 
 ###############################################################################
 
 log = logging.getLogger(__name__)
-
-###############################################################################
-
-DEFAULT_BASE_MODEL = "superb/wav2vec2-base-superb-sid"
 
 EVAL_RESULTS_TEMPLATE = """
 ## Results
@@ -37,58 +30,48 @@ EVAL_RESULTS_TEMPLATE = """
 ### Confusion
 """
 
-DEFAULT_TRAINER_ARGUMENTS_ARGS = {
-    # --- Strategy & Checkpointing ---
-    "evaluation_strategy": "epoch",    
-    "save_strategy": "steps",          
-    "save_steps": 100,                 
-    "save_total_limit": 3,             
-    "load_best_model_at_end": True,    
-    "metric_for_best_model": "accuracy",
-
-    # --- Hardware & Windows Performance ---
-    "fp16": True,                      # Keep True now that CUDA is fixed
-    ""
-    "dataloader_num_workers": 0,       
-    "dataloader_pin_memory": True,     
-    "gradient_checkpointing": True,    
-    "group_by_length": True,           
-    
-    # --- Hyperparameters ---
-    "learning_rate": 3e-5,             # Stable rate for Stage 1 convergence
-    "per_device_train_batch_size": 1,  # Lowered to 4 for VRAM safety with librosa
-    "gradient_accumulation_steps": 16,  # Effective batch size = 16
-    "per_device_eval_batch_size": 8,
-    "num_train_epochs": 10,            # Required for 110-speaker separation
-    "warmup_ratio": 0.1,
-    "logging_steps": 1,                # 🔥 Keep at 1 to monitor the loss movement
-    "report_to": "none",               
-}
-
 ###############################################################################
-# ---- LAZY COLLATOR: load audio -> extract features per batch ----
+# ---- LAZY COLLATOR: loads audio paths and extracts features per batch ----
 class LazyAudioCollator:
-    def __init__(self, fe, max_duration_s: float):
+    """
+    Loads raw audio from disk and extracts features lazily inside each training batch.
+    Avoids pre-materialising the full dataset into RAM.
+
+    Parameters
+    ----------
+    fe : Wav2Vec2FeatureExtractor
+    max_duration_s : float
+        Maximum clip length in seconds; longer clips are truncated.
+    audio_backend : str
+        "soundfile" (default, lossless/fast) or "librosa" (auto-resamples).
+    """
+
+    def __init__(self, fe, max_duration_s: float, audio_backend: str = "soundfile"):
         self.fe = fe
         self.max_len = int(fe.sampling_rate * max_duration_s)
+        self.audio_backend = audio_backend
+
+    def _load(self, path: str) -> np.ndarray:
+        if self.audio_backend == "librosa":
+            import librosa
+            return librosa.load(path, sr=self.fe.sampling_rate)[0]
+        else:
+            import soundfile as sf
+            wav, _ = sf.read(path)
+            return wav
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        import librosa
-        import torch
+        valid = [f for f in features if f.get("audio") is not None]
+        if not valid:
+            log.warning("Empty batch detected — forcing first item to prevent crash.")
+            valid = [features[0]]
 
-        # Filter features to ensure "audio" exists
-        valid_features = [f for f in features if f.get("audio") is not None]
-        
-        # 🚨 FINAL FIX: If a batch is empty, grab the first item anyway to prevent Trainer crash
-        if not valid_features:
-            log.warning("Empty batch detected! Forcing first item to prevent crash.")
-            valid_features = [features[0]]
-
-        paths = [f["audio"]["path"] if isinstance(f["audio"], dict) else str(f["audio"]) 
-                 for f in valid_features]
-        labels = torch.tensor([f["label"] for f in valid_features], dtype=torch.long)
-
-        audio_arrays = [librosa.load(p, sr=self.fe.sampling_rate)[0] for p in paths]
+        paths = [
+            f["audio"]["path"] if isinstance(f["audio"], dict) else str(f["audio"])
+            for f in valid
+        ]
+        labels = torch.tensor([f["label"] for f in valid], dtype=torch.long)
+        audio_arrays = [self._load(p) for p in paths]
 
         batch = self.fe(
             audio_arrays,
@@ -100,16 +83,31 @@ class LazyAudioCollator:
         )
         batch["labels"] = labels
         return batch
-    
-def preprocess_function(batch, feature_extractor, max_duration):
-    import librosa
-    import numpy as np
 
+
+def preprocess_function(
+    batch,
+    feature_extractor,
+    max_duration: float,
+    audio_backend: str = "soundfile",
+):
+    """
+    Precompute input_values for a batch (used for eval pre-caching).
+
+    Parameters
+    ----------
+    audio_backend : str
+        "soundfile" (default) or "librosa" (auto-resamples to target sr).
+    """
     max_len = int(feature_extractor.sampling_rate * max_duration)
     paths = [item["path"] for item in batch["audio"]]
-    
-    # Resample validation data to 16kHz
-    speech_list = [librosa.load(path, sr=feature_extractor.sampling_rate)[0] for path in paths]
+
+    if audio_backend == "librosa":
+        import librosa
+        speech_list = [librosa.load(p, sr=feature_extractor.sampling_rate)[0] for p in paths]
+    else:
+        import soundfile as sf
+        speech_list = [sf.read(p)[0] for p in paths]
 
     inputs = feature_extractor(
         speech_list,
@@ -119,195 +117,308 @@ def preprocess_function(batch, feature_extractor, max_duration):
         padding="max_length",
         return_tensors="np",
     )
-
     batch["input_values"] = inputs["input_values"]
     return batch
 
-from transformers import TrainerCallback
-import shutil
+
+###############################################################################
 
 class EpochArchiveCallback(TrainerCallback):
     """
-    Saves and EVALUATES a dedicated copy of the model at the end of each epoch.
+    At the end of every epoch:
+      1. Copies the latest HF checkpoint into  <output_dir>/final_speakerbox_epoch_N
+      2. Saves the feature extractor into that folder
+      3. Optionally runs eval_model on the validation set
     """
-    def __init__(self, validation_dataset, feature_extractor):
+
+    def __init__(
+        self,
+        validation_dataset,
+        feature_extractor,
+        run_eval: bool = True,
+        eval_mode: str = "softmax",
+        audio_backend: str = "soundfile",
+    ):
         self.validation_dataset = validation_dataset
-        self.fe = feature_extractor # 🚀 Store the extractor here
+        self.fe = feature_extractor
+        self.run_eval = run_eval
+        self.eval_mode = eval_mode
+        self.audio_backend = audio_backend
 
     def on_epoch_end(self, args, state, control, **kwargs):
-        epoch_num = round(state.epoch)
-        archive_path = Path(args.output_dir) / f"final_speakerbox_epoch_{epoch_num}"
-        
-        log.info(f"Archiving model at end of epoch {epoch_num} to {archive_path}")
-        
-        # 1. Save the model weights and config
-        kwargs['model'].save_pretrained(archive_path)
-        
-        # 2. 🔥 THE FIX: Save the missing preprocessor_config.json
-        # Without this, the pipeline() call in eval_model will crash.
+        epoch_num = int(round(state.epoch))
+        output_dir = Path(args.output_dir)
+        archive_path = output_dir / f"final_speakerbox_epoch_{epoch_num}"
+        log.info(f"Archiving checkpoint at end of epoch {epoch_num} → {archive_path}")
+
+        checkpoints = sorted(output_dir.glob("checkpoint-*"), key=lambda p: p.stat().st_mtime)
+        if not checkpoints:
+            log.warning("No checkpoint-* folder found yet — skipping archive.")
+            return control
+
+        if archive_path.exists():
+            shutil.rmtree(archive_path)
+        shutil.copytree(checkpoints[-1], archive_path)
+
+        kwargs["model"].save_pretrained(archive_path)
         self.fe.save_pretrained(archive_path)
 
-        # 3. Now run your custom evaluation
-        # from speakerbox import eval_model
-        # eval_model(self.validation_dataset, model_name=str(archive_path))
-              
+        if self.run_eval:
+            eval_model(
+                self.validation_dataset,
+                model_name=str(archive_path),
+                eval_mode=self.eval_mode,
+                audio_backend=self.audio_backend,
+            )
+        return control
+
+
+###############################################################################
+
 def eval_model(
     validation_dataset: "Dataset",
     model_name: str = "trained-speakerbox",
+    eval_mode: str = "softmax",
+    audio_backend: str = "soundfile",
 ) -> Tuple[float, float, float, float]:
-    import transformers
-    import matplotlib.pyplot as plt
-    import librosa
-    import numpy as np # 🚀 Required for Loss calculation
-    from sklearn.metrics import (
-        ConfusionMatrixDisplay,
-        accuracy_score,
-        log_loss,
-        precision_score,
-        recall_score,
-    )
-    
-    log.info("Setting up evaluation pipeline")
-    transformers.logging.set_verbosity_error()
-    classifier = pipeline("audio-classification", model=model_name)
-    
-    # 🚀 FIX 1: Access the dataset's feature mapping to avoid integer mismatch
-    # This ensures we get "p225" regardless of what integer the dataset assigned today.
-    label_names = validation_dataset.features["label"]
+    """
+    Evaluate a trained speaker-classification model.
 
-    def predict(example: "datasets.arrow_dataset.Example") -> Dict[str, Any]:
-        raw_audio = example["audio"]
-        audio_path = raw_audio["path"] if isinstance(raw_audio, dict) else raw_audio
-        speech, _ = librosa.load(audio_path, sr=classifier.feature_extractor.sampling_rate)
-        
+    Parameters
+    ----------
+    validation_dataset : Dataset
+        HF Dataset with "audio" and "label" columns (audio decoded=False is fine).
+    model_name : str
+        Path to the saved model directory.
+    eval_mode : str
+        "softmax"  — loads model directly, runs a batched forward pass, applies
+                     softmax to logits. Best for MPS / CPU environments (mac-style).
+        "pipeline" — uses HF pipeline + librosa, one sample at a time.
+                     Matches the original windows-style classification path.
+    audio_backend : str
+        "soundfile" (default) or "librosa".  Only used when eval_mode="softmax".
+    """
+    import os
+    import transformers
+    from sklearn.metrics import accuracy_score, log_loss, precision_score, recall_score
+
+    transformers.logging.set_verbosity_error()
+
+    # ------------------------------------------------------------------ #
+    if eval_mode == "pipeline":
+        # --- Windows-style: HF pipeline, one sample at a time ---------- #
+        import librosa
+        from transformers import pipeline as hf_pipeline
+
+        log.info("Setting up evaluation pipeline (pipeline mode)")
+        classifier = hf_pipeline("audio-classification", model=model_name)
+        label_names = validation_dataset.features["label"]
         label2id = classifier.model.config.label2id
         num_labels = len(label2id)
-        pred = classifier(speech, top_k=num_labels)
-        
-        prob_list = [0.0] * num_labels
-        for item in pred:
-            idx = int(label2id[item["label"]])
-            prob_list[idx] = item["score"]
 
-        # 🚀 FIX 2: Use the dataset's own decoding feature for the Truth
-        true_label_name = label_names.int2str(example["label"])
-        
-        # 🔥 THE VISUALIZATION FIX: Live check for mislabeling
-        match_status = "✅ MATCH" if pred[0]["label"] == true_label_name else "❌ MISMATCH"
-        log.info(f"Truth: {true_label_name} | Pred: {pred[0]['label']} | Status: {match_status}")
-        
-        return {
-            "pred_label": str(pred[0]["label"]),
-            "true_label": str(true_label_name),
-            "pred_scores": prob_list,
-        }
-        
-    log.info("Running eval...")
-    # The .map function will now output your match status for every sample in the console.
-    validation_dataset = validation_dataset.map(predict)
+        def _predict_one(example):
+            print(example)
+            raw = example["audio"]
+            path = raw["path"] if isinstance(raw, dict) else raw
+            speech, _ = librosa.load(path, sr=classifier.feature_extractor.sampling_rate)
 
-    # --- METRICS CALCULATION ---
-    # 🚀 FIX 3: Convert scores to a NumPy array for Scikit-Learn stability
-    y_pred_probs = np.array(validation_dataset["pred_scores"])
-    all_labels = list(classifier.model.config.label2id.keys())
+            preds = classifier(speech, top_k=num_labels)
+            prob_list = [0.0] * num_labels
+            for item in preds:
+                prob_list[int(label2id[item["label"]])] = item["score"]
 
-    accuracy = accuracy_score(
-        y_true=validation_dataset["true_label"],
-        y_pred=validation_dataset["pred_label"],
-    )
-    
-    # Loss Fix: Alignment of probabilities to label order
-    loss = log_loss(
-        y_true=validation_dataset["true_label"],
-        y_pred=y_pred_probs,
-        labels=all_labels 
-    )
-    
-    precision = precision_score(
-        y_true=validation_dataset["true_label"],
-        y_pred=validation_dataset["pred_label"],
-        average="weighted",
-        zero_division=0 
-    )
-    recall = recall_score(
-        y_true=validation_dataset["true_label"],
-        y_pred=validation_dataset["pred_label"],
-        average="weighted",
-        zero_division=0 
-    )
+            true_name = label_names.int2str(example["label"])
+            match = "✅" if preds[0]["label"] == true_name else "❌"
+            log.info(f"Truth: {true_name} | Pred: {preds[0]['label']} | {match}")
+            return {
+                "pred_label": str(preds[0]["label"]),
+                "true_label": str(true_name),
+                "pred_scores": prob_list,
+            }
 
-    # Store metrics in results.md for your documentation
-    with open(f"{model_name}/results.md", "w") as open_f:
-        open_f.write(
-            EVAL_RESULTS_TEMPLATE.format(
-                accuracy=accuracy,
-                precision=precision,
-                recall=recall,
-                loss=loss,
+        log.info("Running eval (pipeline mode)...")
+        validation_dataset = validation_dataset.map(_predict_one)
+
+        y_pred_probs = np.array(validation_dataset["pred_scores"])
+        all_labels = list(label2id.keys())
+
+    else:
+        # --- Mac/softmax-style: batched forward pass -------------------- #
+        from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForSequenceClassification
+
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+
+        log.info(f"Setting up evaluation model (softmax mode, device={device})")
+        model = Wav2Vec2ForSequenceClassification.from_pretrained(model_name).to(device)
+        model.eval()
+        feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
+
+        id2label = model.config.id2label
+        label2id = model.config.label2id
+        all_labels = [id2label[i] for i in range(len(id2label))]
+
+        dataset_labels = list(validation_dataset.features["label"].names)
+        max_len = int(feature_extractor.sampling_rate * 2.0)
+
+        @torch.no_grad()
+        def _predict_batch(batch):
+            paths = [
+                a["path"] if isinstance(a, dict) else str(a)
+                for a in batch["audio"]
+            ]
+            if audio_backend == "librosa":
+                import librosa
+                wavs = [librosa.load(p, sr=feature_extractor.sampling_rate)[0] for p in paths]
+            else:
+                import soundfile as sf
+                wavs = [sf.read(p)[0] for p in paths]
+
+            inputs = feature_extractor(
+                wavs,
+                sampling_rate=feature_extractor.sampling_rate,
+                max_length=max_len,
+                truncation=True,
+                padding=True,
+                return_tensors="pt",
             )
-        )
+            
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            probs = torch.softmax(model(**inputs).logits, dim=-1).cpu().numpy()
+            pred_ids = np.argmax(probs, axis=-1)
+            
+            return {
+                "pred_label": [id2label[int(i)] for i in pred_ids],
+                "true_label": [dataset_labels[x] for x in batch["label"]],
+                "pred_scores": probs.tolist(),
+            }
 
-    return (accuracy, precision, recall, loss)
+        log.info("Running eval (softmax mode)...")
+        validation_dataset = validation_dataset.map(
+            _predict_batch, batched=True, batch_size=16, load_from_cache_file=False
+        )
+        y_pred_probs = np.array(validation_dataset["pred_scores"])
+
+    # ------------------------------------------------------------------ #
+    # Metrics (shared)
+    # ------------------------------------------------------------------ #
+    y_true = validation_dataset["true_label"]
+    y_pred = validation_dataset["pred_label"]
+
+    accuracy  = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average="weighted", zero_division=0)
+    recall    = recall_score(y_true, y_pred, average="weighted", zero_division=0)
+    loss      = log_loss(y_true, y_pred_probs, labels=all_labels)
+
+    os.makedirs(model_name, exist_ok=True)
+    with open(f"{model_name}/results.md", "w") as f:
+        f.write(EVAL_RESULTS_TEMPLATE.format(
+            accuracy=accuracy, precision=precision, recall=recall, loss=loss
+        ))
+    log.info(f"Eval results saved → {model_name}/results.md")
+
+    return accuracy, precision, recall, loss
+
+
+###############################################################################
+
+
+def _find_last_checkpoint(output_dir: str) -> Optional[str]:
+    """
+    Returns the path of the latest checkpoint-* folder inside output_dir,
+    or None if no checkpoints exist yet.
+    Passing None to trainer.train() starts fresh without crashing.
+    """
+    output_path = Path(output_dir)
+    if not output_path.exists():
+        return None
+    checkpoints = sorted(
+        output_path.glob("checkpoint-*"),
+        key=lambda p: int(p.name.split("-")[-1])
+    )
+    if not checkpoints:
+        return None
+    latest = checkpoints[-1]
+    log.info(f"Resuming from checkpoint: {latest}")
+    return str(latest)
+
+
 def train(
     dataset: "DatasetDict",
-    model_name: str = "trained-speakerbox",
-    model_base: str = DEFAULT_BASE_MODEL,
-    max_duration: float = 2.0,
+    model_name: str,
+    model_base: str,
+    max_duration: float,
+    trainer_arguments_kws: Dict[str, Any],
+    audio_backend: str = "soundfile",
+    metadata_cache_path: Optional[str] = None,
     seed: Optional[int] = None,
-    use_cpu: bool = False,
-    trainer_arguments_kws: Dict[str, Any] = DEFAULT_TRAINER_ARGUMENTS_ARGS,
+    resume_from_checkpoint: bool = True,
 ) -> Path:
     """
-    Train a speaker classification model (LAZY feature extraction to avoid RAM blow-up).
+    Train a speaker classification model with lazy per-batch feature extraction.
 
-    Key change:
-    - Do NOT dataset.map(preprocess) to materialize input_values for whole dataset.
-    - Read audio + extract features inside a custom data_collator per-batch.
+    Parameters
+    ----------
+    dataset : DatasetDict
+        Must contain "train" and either "valid" or "test" splits.
+    model_name : str
+        Output directory for the trained model.
+    model_base : str
+        HF model ID to fine-tune from.
+    max_duration : float
+        Maximum audio clip length in seconds (clips are truncated/padded).
+    trainer_arguments_kws : dict
+        Passed directly to HuggingFace TrainingArguments.
+    audio_backend : str
+        "soundfile" (default) or "librosa" — used by collator and eval.
+    metadata_cache_path : str or None
+        Path to cache the Audio-cast dataset.  If None, defaults to
+        <model_name>/<modelname>_metadata_ds.  Set to "" to disable caching.
+    seed : int or None
+        Global random seed for reproducibility.
+    resume_from_checkpoint : bool
+        If True, auto-detects and resumes from the latest checkpoint in output_dir.
+        If False (or no checkpoint exists), training starts from scratch.
     """
-    import numpy as np
-    import torch
     import transformers
-    import soundfile as sf
     from datasets import Audio, load_metric
-    # from evaluate import load as load_metric
-    
     from transformers import (
         Trainer,
         TrainingArguments,
         Wav2Vec2FeatureExtractor,
         Wav2Vec2ForSequenceClassification,
     )
-
     from .utils import set_global_seed
 
-    # Handle seed
     if seed is not None:
         set_global_seed(seed)
-        
-    # Check for CUDA (NVIDIA GPU)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info(f"Training will run on: {device}")
 
-    # Handle cpu
-    if device.type == "cpu":
-        log.warning("No CUDA GPU found. Disabling FP16 and switching to CPU.")
+    # --- Device selection ---
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        torch.mps.empty_cache()
+    else:
+        device = torch.device("cpu")
+        log.warning("No GPU found — disabling fp16 and forcing CPU.")
         trainer_arguments_kws["fp16"] = False
         trainer_arguments_kws["no_cuda"] = True
+    log.info(f"Training will run on: {device}")
 
-    # Pre-emptively clear the cache to maximize VRAM
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache() 
-
-    # Load feature extractor
+    # --- Feature extractor + label maps ---
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_base)
-    
-    # Build label LUTs
     label2id, id2label = {}, {}
     for i, label in enumerate(dataset["train"].features["label"].names):
         label2id[label] = str(i)
         id2label[str(i)] = label
 
-    # Create AutoModel
+    # --- Model ---
     log.info("Setting up model")
     model = Wav2Vec2ForSequenceClassification.from_pretrained(
         model_base,
@@ -315,130 +426,73 @@ def train(
         label2id=label2id,
         id2label=id2label,
         ignore_mismatched_sizes=True,
-        # 🔥 CRITICAL: Force the model to ONLY return the classification logits
-        output_hidden_states=False, 
+        output_hidden_states=False,
         output_attentions=False,
-    )
-    
-    # Move model to GPU
-    model.to(device) 
+    ).to(device)
 
-    log.info("Casting all audio paths to HF Audio (decode=False)")
-    # Define a specific path for the metadata cache
-    
-    metadata_cache_path = Path(model_name) / "speakerboxdts_metadata_ds"
-
-    if metadata_cache_path.exists():
-        log.info(f"🚀 Loading pre-cast metadata from: {metadata_cache_path}")
-        from datasets import load_from_disk
-        dataset = load_from_disk(str(metadata_cache_path))
-    else:
-        log.info("Casting all audio paths to HF Audio (decode=False)...")
+    # --- Audio metadata cache (stores paths only, no decoded waveforms) ---
+    if metadata_cache_path == "":
+        # Caching explicitly disabled
+        log.info("Metadata caching disabled — casting on-the-fly.")
         dataset = dataset.cast_column(
             "audio", Audio(sampling_rate=feature_extractor.sampling_rate, decode=False)
         )
-        
-        # Ensure the output directory exists before saving
-        metadata_cache_path.parent.mkdir(parents=True, exist_ok=True)
-        dataset.save_to_disk(str(metadata_cache_path))
-        log.info(f"💾 Metadata cached successfully to {metadata_cache_path}")
-
-    # Select eval split first
-    # Find this section in your train() function
-    if "valid" in dataset:
-        full_valid = dataset["valid"]
-        eval_dataset = full_valid.shuffle(seed=42).select(range(min(500, len(full_valid))))
-        log.info(f"Sub-sampling validation set to {len(eval_dataset)} examples for speed.")
     else:
-        eval_n = min(500, len(dataset["test"]))
-        eval_dataset = dataset["test"].shuffle(seed=0).select(range(eval_n))
+        cache = Path(metadata_cache_path) if metadata_cache_path else Path(model_name) / f"{Path(model_name).name}_metadata_ds"
+        if cache.exists():
+            log.info(f"Loading pre-cast metadata cache from: {cache}")
+            from datasets import load_from_disk
+            dataset = load_from_disk(str(cache))
+        else:
+            log.info("Casting audio paths to HF Audio (decode=False) and caching...")
+            dataset = dataset.cast_column(
+                "audio", Audio(sampling_rate=feature_extractor.sampling_rate, decode=False)
+            )
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            dataset.save_to_disk(str(cache))
+            log.info(f"Metadata cached → {cache}")
 
-    # Precompute eval features
-    # eval_dataset = eval_dataset.map(
-    #     preprocess_function,
-    #     batched=True,
-    #     batch_size=32,
-    #     fn_kwargs={
-    #         "feature_extractor": feature_extractor,
-    #         "max_duration": max_duration,
-    #     },
-    # )
-    # eval_dataset.set_format("torch", columns=["input_values", "label"])
+    # --- Training arguments ---
+    args = TrainingArguments(output_dir=model_name, **trainer_arguments_kws)
 
-    # args = TrainingArguments(
-    #     output_dir=model_name,
-    #     **trainer_arguments_kws,
-    # )
-    
-    # Inside speakerbox/main.py
-    args = TrainingArguments(
-        output_dir=model_name,
-        learning_rate=6.202445652173913e-06,
-        num_train_epochs=3,
-        fp16=False,
-        logging_steps=10,
-        
-        # --- Speed & VRAM Surgery ---
-        evaluation_strategy="no",
-        # evaluation_strategy="epoch", 
-        # per_device_eval_batch_size=2, # 🚀 Lowered to 2 to fit in 4GB VRAM
-        # eval_accumulation_steps=1,    # 🚨 Flush memory to CPU after EVERY batch
-        # fp16_full_eval=True,          # Keep half-precision for speed
-        
-        ignore_data_skip=True,
-        save_steps=200,
-        save_total_limit=3,
-        per_device_train_batch_size=4, 
-        gradient_accumulation_steps=4, 
-        dataloader_num_workers=0,
-        remove_unused_columns=False,
-        report_to="none",
-    )
-
-    # Metrics
+    # --- Accuracy metric ---
     metric = load_metric("accuracy")
 
     def compute_metrics(eval_pred):
         logits = eval_pred.predictions
         if isinstance(logits, tuple):
-            logits = logits[0]  # 🔥 FIX: extract logits
-
+            logits = logits[0]
         preds = np.argmax(logits, axis=-1)
         return metric.compute(predictions=preds, references=eval_pred.label_ids)
 
-    data_collator = LazyAudioCollator(feature_extractor, max_duration)
-
-    archive_eval_callback = EpochArchiveCallback(
-        validation_dataset=dataset["valid"], 
-        feature_extractor=feature_extractor
+    # --- Collator and epoch archive callback ---
+    data_collator = LazyAudioCollator(feature_extractor, max_duration, audio_backend=audio_backend)
+    archive_callback = EpochArchiveCallback(
+        validation_dataset=dataset["valid"],
+        feature_extractor=feature_extractor,
+        audio_backend=audio_backend,
     )
 
-    # Train
+    # --- Trainer ---
     trainer = Trainer(
         model=model,
         args=args,
         train_dataset=dataset["train"],
-        # eval_dataset=eval_dataset, # ✅ Now uses 10% valid split
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        callbacks=[archive_eval_callback], 
+        callbacks=[archive_callback],
     )
-    
-     # Optional: reduce MPS fragmentation risk
-    if torch.backends.mps.is_available():
-        torch.mps.empty_cache()
-    torch.cuda.empty_cache()
 
     transformers.logging.set_verbosity_info()
-    trainer.train(resume_from_checkpoint=True)
+    checkpoint = _find_last_checkpoint(model_name) if resume_from_checkpoint else None
+    trainer.train(resume_from_checkpoint=checkpoint)
     trainer.save_model()
     feature_extractor.save_pretrained(model_name)
-    # eval_model(dataset["valid"], model_name=str(model_name))
-    
 
     return Path(model_name).resolve()
 
 
+###############################################################################
 
 def apply(  # noqa: C901
     audio: Union[str, Path],
@@ -449,37 +503,28 @@ def apply(  # noqa: C901
     confidence_threshold: float = 0.85,
 ) -> "Annotation":
     """
-    Iteritively apply the model across chunks of an audio file.
+    Iteratively apply the model across chunks of an audio file.
 
     Parameters
     ----------
-    audio: Union[str, Path]
-        The audio filepath.
-    model: str
-        The path to the trained audio-classification model.
-    mode: Literal["diarize", "naive"]
-        Which mode to use for processing. "diarize" will diarize the audio
-        prior to generating chunks to classify. "naive" will iteratively process
-        chunks. "naive" is assumed to be faster but have worse performance.
-        Default: "diarize"
-    min_chunk_duration: float
-        The minimum size in seconds a chunk of audio is allowed to be
-        for it to be ran through the classification pipeline.
-        Default: 0.5 seconds
-    max_chunk_duration: float
-        The maximum size in seconds a chunk of audio is allowed to be
-        for it to be ran through the classification pipeline.
-        Default: 2 seconds
-    confidence_threshold: float
-        A value to act as a lower bound to the reported confidence
-        of the model prediction. Any classification that has a confidence
-        lower than this value will be ignore and not added as a segment.
-        Default: 0.95 (fairly strict / must have high confidence in prediction)
+    audio : Union[str, Path]
+        Path to the audio file.
+    model : str
+        Path to the trained audio-classification model.
+    mode : Literal["diarize", "naive"]
+        "diarize" — diarizes first then classifies each turn (slower, better).
+        "naive"   — slides a fixed window and classifies each chunk (faster).
+    min_chunk_duration : float
+        Minimum chunk size in seconds to be classified. Default: 0.5
+    max_chunk_duration : float
+        Maximum chunk size in seconds. Default: 2.0
+    confidence_threshold : float
+        Predictions below this confidence are discarded. Default: 0.85
 
     Returns
     -------
     Annotation
-        A pyannote.core Annotation with all labeled segments.
+        pyannote.core Annotation with all labeled segments.
     """
     import numpy as np
     from pyannote.audio import Pipeline
@@ -489,188 +534,73 @@ def apply(  # noqa: C901
     from pydub import AudioSegment
     from tqdm import tqdm
 
-    # Just set track name to the same as the audio filepath
     track_name = str(audio)
-
-    # Read audio file
     loaded_audio = AudioSegment.from_file(audio)
-
-    # Load model
     classifier = pipeline("audio-classification", model=model)
-
-    # Get number of speakers
     n_speakers = len(classifier.model.config.id2label)
-
-    # Generate random uuid filename for storing temp audio chunks
-    tmp_audio_chunk_save_path = Path(".tmp-audio-chunk-during-apply.wav")
+    tmp_path = Path(".tmp-audio-chunk-during-apply.wav")
 
     def _diarize() -> List[Tuple[Segment, TrackName, Label]]:  # noqa: C901
         diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization")
         dia = diarization_pipeline(audio)
-
-        # Prep for calculations
-        max_chunk_duration_millis = max_chunk_duration * 1000
-
-        # Return chunks for each diarized section
+        max_ms = max_chunk_duration * 1000
         records: List[Tuple[Segment, TrackName, Label]] = []
+
         for turn, _, _ in tqdm(dia.itertracks(yield_label=True)):
-            # Keep track of each turn chunk classification and score
             chunk_scores: Dict[str, List[float]] = {}
+            t_start_ms = turn.start * 1000
+            t_end_ms = turn.end * 1000
 
-            # Get audio slice for turn
-            turn_start_millis = turn.start * 1000
-            turn_end_millis = turn.end * 1000
+            for cs_float in np.arange(t_start_ms, t_end_ms, max_ms):
+                cs = round(cs_float)
+                ce = round(cs + max_ms)
+                if t_end_ms < ce:
+                    ce = round(t_end_ms)
+                if (ce - cs) >= min_chunk_duration:
+                    loaded_audio[cs:ce].export(tmp_path, format="wav")
+                    for pred in classifier(str(tmp_path), top_k=n_speakers):
+                        chunk_scores.setdefault(pred["label"], []).append(pred["score"])
 
-            # Split into smaller chunks
-            for chunk_start_millis_float in np.arange(
-                turn_start_millis,
-                turn_end_millis,
-                max_chunk_duration_millis,
-            ):
-                # Round start to nearest int
-                chunk_start_millis = round(chunk_start_millis_float)
+            if chunk_scores:
+                mean_scores = {spk: sum(s) / len(s) for spk, s in chunk_scores.items()}
+                best = max(mean_scores, key=mean_scores.get)
+                turn_speaker = best if mean_scores[best] >= confidence_threshold else None
+            else:
+                turn_speaker = None
 
-                # Tentative chunk end
-                chunk_end_millis = round(chunk_start_millis + max_chunk_duration_millis)
-
-                # Determine chunk end time
-                # If start + chunk duration is longer than turn
-                # Chunk needs to be cut at turn end
-                if turn_end_millis < chunk_end_millis:
-                    chunk_end_millis = round(turn_end_millis)
-
-                # Only allow if duration is greater than
-                # min intra turn chunk duration
-                duration = chunk_end_millis - chunk_start_millis
-                if duration >= min_chunk_duration:
-                    # Get chunk
-                    chunk = loaded_audio[chunk_start_millis:chunk_end_millis]
-
-                    # Write to temp
-                    chunk.export(tmp_audio_chunk_save_path, format="wav")
-
-                    # Predict and store scores for turn
-                    preds = classifier(
-                        str(tmp_audio_chunk_save_path),
-                        top_k=n_speakers,
-                    )
-                    for pred in preds:
-                        if pred["label"] not in chunk_scores:
-                            chunk_scores[pred["label"]] = []
-                        chunk_scores[pred["label"]].append(pred["score"])
-
-            # Create mean score
-            turn_speaker = None
-            if len(chunk_scores) > 0:
-                mean_scores: Dict[str, float] = {}
-                for speaker, scores in chunk_scores.items():
-                    mean_scores[speaker] = sum(scores) / len(scores)
-
-                # Get highest scoring speaker and their score
-                highest_mean_speaker = ""
-                highest_mean_score = 0.0
-                for speaker, score in mean_scores.items():
-                    if score > highest_mean_score:
-                        highest_mean_speaker = speaker
-                        highest_mean_score = score
-
-                # Threshold holdout
-                if highest_mean_score >= confidence_threshold:
-                    turn_speaker = highest_mean_speaker
-
-            # Store record
-            records.append(
-                (
-                    Segment(turn.start, turn.end),
-                    track_name,
-                    turn_speaker,
-                )
-            )
-
+            records.append((Segment(turn.start, turn.end), track_name, turn_speaker))
         return records
 
     def _naive() -> List[Tuple[Segment, TrackName, Label]]:
-        # Move audio window, apply, and append annotation record
         records: List[Tuple[Segment, TrackName, Label]] = []
-        for chunk_start_seconds in tqdm(
-            np.arange(0, loaded_audio.duration_seconds, max_chunk_duration)
-        ):
-            # Calculate chunk end
-            chunk_end_seconds = chunk_start_seconds + max_chunk_duration
-            if chunk_end_seconds > loaded_audio.duration_seconds:
-                chunk_end_seconds = loaded_audio.duration_seconds
-
-            # Check if duration is long enough
-            duration = chunk_end_seconds - chunk_start_seconds
-            if duration >= min_chunk_duration:
-                # Convert seconds to millis
-                chunk_start_millis = chunk_start_seconds * 1000
-                chunk_end_millis = chunk_end_seconds * 1000
-
-                # Select chunk
-                chunk = loaded_audio[chunk_start_millis:chunk_end_millis]
-
-                # Write chunk to temp
-                chunk.export(tmp_audio_chunk_save_path, format="wav")
-
-                # Predict, keep top 1 and store to records
-                pred = classifier(str(tmp_audio_chunk_save_path), top_k=1)[0]
+        for cs in tqdm(np.arange(0, loaded_audio.duration_seconds, max_chunk_duration)):
+            ce = min(cs + max_chunk_duration, loaded_audio.duration_seconds)
+            if (ce - cs) >= min_chunk_duration:
+                loaded_audio[cs * 1000 : ce * 1000].export(tmp_path, format="wav")
+                pred = classifier(str(tmp_path), top_k=1)[0]
                 if pred["score"] >= confidence_threshold:
-                    records.append(
-                        (
-                            Segment(chunk_start_seconds, chunk_end_seconds),
-                            track_name,
-                            pred["label"],
-                        )
-                    )
-
+                    records.append((Segment(cs, ce), track_name, pred["label"]))
         return records
 
-    # Classify based off strategy
-    mode_lut = {
-        "diarize": _diarize,
-        "naive": _naive,
-    }
-
-    # Generate records and clean up
     try:
-        records = mode_lut[mode]()
+        records = {"diarize": _diarize, "naive": _naive}[mode]()
 
-        # Merge segments that are touching
-        merged_records: List[Tuple[Segment, TrackName, Label]] = []
-        current_record: Optional[Tuple[Segment, TrackName, Label]] = None
-        for record in records:
-            if current_record is None:
-                current_record = record
+        # Merge touching segments with the same label
+        merged: List[Tuple[Segment, TrackName, Label]] = []
+        cur = None
+        for rec in records:
+            if cur is None:
+                cur = rec
+            elif rec[2] == cur[2] and rec[0].start == cur[0].end:
+                cur = (Segment(cur[0].start, rec[0].end), track_name, cur[2])
             else:
-                # The label matches and the segment start and end points are
-                # touching, merge
-                if (
-                    record[2] == current_record[2]
-                    and record[0].start == current_record[0].end
-                ):
-                    # Make new record with merged data
-                    # because tuples are immutable
-                    current_record = (
-                        Segment(current_record[0].start, record[0].end),
-                        track_name,
-                        current_record[2],
-                    )
-                else:
-                    merged_records.append(current_record)
-                    current_record = record
+                merged.append(cur)
+                cur = rec
+        if cur is not None:
+            merged.append(cur)
 
-        # Add the last current segment
-        # we only do this type check to handle the type error
-        if current_record is not None:
-            merged_records.append(current_record)
-
-        return Annotation.from_records(merged_records)
+        return Annotation.from_records(merged)
 
     finally:
-        # Always clean up tmp file
-        if tmp_audio_chunk_save_path.exists():
-            tmp_audio_chunk_save_path.unlink()
-
-
-
+        if tmp_path.exists():
+            tmp_path.unlink()
