@@ -353,6 +353,7 @@ def train(
     model_base: str,
     max_duration: float,
     trainer_arguments_kws: Dict[str, Any],
+    eval_mode: str = "softmax",
     audio_backend: str = "soundfile",
     metadata_cache_path: Optional[str] = None,
     seed: Optional[int] = None,
@@ -410,7 +411,7 @@ def train(
         trainer_arguments_kws["fp16"] = False
         trainer_arguments_kws["no_cuda"] = True
     log.info(f"Training will run on: {device}")
-
+    log.info(f"Eval mode: {eval_mode}")
     # --- Feature extractor + label maps ---
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_base)
     label2id, id2label = {}, {}
@@ -467,10 +468,12 @@ def train(
 
     # --- Collator and epoch archive callback ---
     data_collator = LazyAudioCollator(feature_extractor, max_duration, audio_backend=audio_backend)
+    
     archive_callback = EpochArchiveCallback(
         validation_dataset=dataset["valid"],
         feature_extractor=feature_extractor,
         audio_backend=audio_backend,
+        eval_mode=eval_mode,
     )
 
     # --- Trainer ---

@@ -89,6 +89,7 @@ def cmd_train(args):
         trainer_arguments_kws=trainer_args,
         audio_backend=args.audio_backend,
         metadata_cache_path=args.metadata_cache,
+        eval_mode=args.eval_mode,
         seed=args.seed,
     )
     log.info(f"Model saved -> {model_path}")
@@ -150,9 +151,17 @@ def build_parser() -> argparse.ArgumentParser:
             help="Minimum unique files per speaker to be included. (default: 1)",
         )
         p.add_argument(
-        "--max-samples", type=int, default=500, metavar="N",
+        "--max-samples", type=int, default=None, metavar="N",
         help="Total number of audio samples to use (useful for quick tests).",
-    )
+        )
+        p.add_argument(
+            "--eval-mode", choices=["softmax", "pipeline"], default="softmax",
+            help=(
+                "softmax:  batched forward pass + softmax (mac/MPS/CPU friendly). "
+                "pipeline: HF pipeline, one sample at a time (windows-style). "
+                "(default: softmax)"
+            ),
+        )
 
     # ---- train-specific arguments ----
     for p in (p_train, p_train_eval):
@@ -209,14 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--eval-model", default=None, metavar="PATH",
             help="Path to the model to evaluate. Defaults to --output if not specified.",
         )
-        p.add_argument(
-            "--eval-mode", choices=["softmax", "pipeline"], default="softmax",
-            help=(
-                "softmax:  batched forward pass + softmax (mac/MPS/CPU friendly). "
-                "pipeline: HF pipeline, one sample at a time (windows-style). "
-                "(default: softmax)"
-            ),
-        )
+        
         
     # ---- mac shortcut ----
     p_mac = sub.add_parser(
@@ -240,6 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Model to eval after training. Defaults to --output.")
     p_mac.add_argument("--resume",    action="store_true",  default=True)
     p_mac.add_argument("--no-resume", dest="resume", action="store_false")
+    p_mac.add_argument( "--max-samples", type=int, default=None, metavar="N")
 
     # ---- windows shortcut ----
     p_win = sub.add_parser(
@@ -263,6 +266,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Model to eval after training. Defaults to --output.")
     p_win.add_argument("--resume",    action="store_true",  default=True)
     p_win.add_argument("--no-resume", dest="resume", action="store_false")
+    p_win.add_argument( "--max-samples", type=int, default=None, metavar="N")
 
     return parser
 
