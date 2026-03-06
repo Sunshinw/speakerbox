@@ -4,10 +4,10 @@ import pandas as pd
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 from datasets import Audio, Dataset, DatasetDict
-from torch.cuda import seed
-from transformers import data
-from speakerbox.tests import data
-from speakerbox.main import train, eval_model
+
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
+from speakerbox.main import train, eval_model    # always uses YOUR local main.py
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -63,22 +63,23 @@ def prepare_dataset(root_path: str, min_speaker_files: int, seed: int, max_sampl
 
 # Sub-command handlers
 
-def cmd_train(args):
+def cmd_train(args) -> DatasetDict:
     dataset = prepare_dataset(args.dataset, args.min_speaker_files, args.seed, args.max_samples)
+
     trainer_args = {
-        "learning_rate":                args.lr,
-        "num_train_epochs":             args.epochs,
-        "per_device_train_batch_size":  args.batch,
-        "gradient_accumulation_steps":  args.accum,
-        "fp16":                         args.fp16,
-        "evaluation_strategy":          "no",
-        "save_strategy":                "steps",
-        "save_steps":                   args.save_steps,
-        "save_total_limit":             3,
-        "dataloader_num_workers":       0,   # keep 0 on Windows
-        "remove_unused_columns":        False,
-        "logging_steps":                10,
-        "report_to":                    "none",
+        "learning_rate":               args.lr,
+        "num_train_epochs":            args.epochs,
+        "per_device_train_batch_size": args.batch,
+        "gradient_accumulation_steps": args.accum,
+        "fp16":                        args.fp16,
+        "evaluation_strategy":         "no",
+        "save_strategy":               "steps",
+        "save_steps":                  args.save_steps,
+        "save_total_limit":            3,
+        "dataloader_num_workers":      0,       # keep 0 on Windows
+        "remove_unused_columns":       False,
+        "logging_steps":               10,
+        "report_to":                   "none",
     }
 
     model_path = train(
@@ -91,12 +92,14 @@ def cmd_train(args):
         metadata_cache_path=args.metadata_cache,
         eval_mode=args.eval_mode,
         seed=args.seed,
+        resume_from_checkpoint=getattr(args, "resume", True),
+        train_mode=args.train_mode,
     )
-    log.info(f"Model saved -> {model_path}")
+    log.info(f"Model saved → {model_path}")
     return dataset
 
 
-def cmd_eval(args, dataset=None):
+def cmd_eval(args, dataset: DatasetDict = None):
     if dataset is None:
         dataset = prepare_dataset(args.dataset, args.min_speaker_files, args.seed)
 
@@ -109,164 +112,101 @@ def cmd_eval(args, dataset=None):
         audio_backend=args.audio_backend,
     )
     log.info(
-        f"Eval results -- "
-        f"Accuracy: {metrics[0]:.4f} | Precision: {metrics[1]:.4f} | "
+        f"Eval — Accuracy: {metrics[0]:.4f} | Precision: {metrics[1]:.4f} | "
         f"Recall: {metrics[2]:.4f} | Loss: {metrics[3]:.4f}"
     )
 
-# CLI definition
+
+###############################################################################
+# ── CLI HELPERS ───────────────────────────────────────────────────────────────
+
+def _add_shared_args(p):
+    p.add_argument("--dataset", required=True, metavar="PATH",
+                   help="Root directory containing speaker audio files.")
+    p.add_argument("--output", default="exps/model", metavar="PATH",
+                   help="Output directory for the trained model. (default: exps/model)")
+    p.add_argument("--audio-backend", choices=["soundfile", "librosa"], default="soundfile",
+                   help="soundfile: fast, 16 kHz assumed. librosa: auto-resamples. (default: soundfile)")
+    p.add_argument("--min-speaker-files", type=int, default=1, metavar="N",
+                   help="Min unique files per speaker to include. (default: 1)")
+    p.add_argument("--max-samples", type=int, default=None, metavar="N",
+                   help="Cap total samples (useful for quick tests).")
+    p.add_argument("--eval-mode", choices=["softmax", "pipeline"], default="softmax",
+                   help="softmax: batched (mac-friendly). pipeline: one-by-one (windows). (default: softmax)")
+
+
+def _add_train_args(p):
+    p.add_argument("--model-base", default="superb/wav2vec2-base-superb-sid", metavar="HF_ID",
+                   help="HF model ID. Used for weights (finetune) or config only (scratch). "
+                        "(default: superb/wav2vec2-base-superb-sid)")
+    p.add_argument(
+        "--train-mode", choices=["finetune", "scratch"], default="scratch",
+        help=(
+            "finetune (default): load pretrained weights from --model-base, "
+            "fine-tune on your speakers. Fast, good with limited data. "
+            "scratch: random weight init — only the architecture config is "
+            "taken from --model-base, no pretrained weights used. Needs more "
+            "data/compute but no borrowed weights."
+        ),
+    )
+    p.add_argument("--max-duration", type=float, default=3.0, metavar="SEC",
+                   help="Max clip length in seconds; longer clips truncated. (default: 3.0)")
+    p.add_argument("--epochs",     type=int,   default=10,   metavar="N",  help="Training epochs. (default: 10)")
+    p.add_argument("--batch",      type=int,   default=4,    metavar="N",  help="Per-device batch size. (default: 4)")
+    p.add_argument("--accum",      type=int,   default=4,    metavar="N",  help="Grad accum steps; effective batch = batch x accum. (default: 4)")
+    p.add_argument("--lr",         type=float, default=3e-5, metavar="LR", help="Learning rate. (default: 3e-5)")
+    p.add_argument("--fp16",       action="store_true",                    help="Mixed-precision (NVIDIA only).")
+    p.add_argument("--save-steps", type=int,   default=200,  metavar="N",  help="Checkpoint every N steps. (default: 200)")
+    p.add_argument("--metadata-cache", default=None, metavar="PATH",
+                   help="Audio-cast dataset cache path. None=auto, ''=disable.")
+    p.add_argument("--seed", type=int, default=42, metavar="N", help="Random seed. (default: 42)")
+    p.add_argument("--resume",    action="store_true", default=True,
+                   help="Auto-resume from latest checkpoint if found. (default: True)")
+    p.add_argument("--no-resume", dest="resume", action="store_false",
+                   help="Force training from scratch (checkpoint-wise).")
+
+
+def _add_eval_args(p):
+    p.add_argument("--eval-model", default=None, metavar="PATH",
+                   help="Model path to evaluate. Defaults to --output.")
+
+
+###############################################################################
+# ── CLI DEFINITION ────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Speakerbox -- train and/or evaluate a speaker-ID model.",
+        description="Speakerbox — train and/or evaluate a speaker-ID model.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-
     sub = parser.add_subparsers(dest="command", required=True)
+
+    # ── manual sub-commands ─────────────────────────────────────────────── #
     p_train      = sub.add_parser("train",      help="Train only")
     p_eval       = sub.add_parser("eval",        help="Evaluate only")
     p_train_eval = sub.add_parser("train_eval",  help="Train then evaluate")
 
-    # ---- shared arguments (added to every sub-command) ----
     for p in (p_train, p_eval, p_train_eval):
-        p.add_argument(
-            "--dataset", required=True, metavar="PATH",
-            help="Root directory containing speaker audio files.",
-        )
-        p.add_argument(
-            "--output", default="exps/model", metavar="PATH",
-            help="Output directory for the trained model. (default: exps/model)",
-        )
-        p.add_argument(
-            "--audio-backend", choices=["soundfile", "librosa"], default="soundfile",
-            help=(
-                "soundfile: fast, assumes files are already 16 kHz. "
-                "librosa: slower, auto-resamples to target SR. "
-                "(default: soundfile)"
-            ),
-        )
-        p.add_argument(
-            "--min-speaker-files", type=int, default=1, metavar="N",
-            help="Minimum unique files per speaker to be included. (default: 1)",
-        )
-        p.add_argument(
-        "--max-samples", type=int, default=None, metavar="N",
-        help="Total number of audio samples to use (useful for quick tests).",
-        )
-        p.add_argument(
-            "--eval-mode", choices=["softmax", "pipeline"], default="softmax",
-            help=(
-                "softmax:  batched forward pass + softmax (mac/MPS/CPU friendly). "
-                "pipeline: HF pipeline, one sample at a time (windows-style). "
-                "(default: softmax)"
-            ),
-        )
-
-    # ---- train-specific arguments ----
+        _add_shared_args(p)
     for p in (p_train, p_train_eval):
-        p.add_argument(
-            "--model-base", default="superb/wav2vec2-base-superb-sid", metavar="HF_ID",
-            help="HuggingFace model ID to fine-tune from. "
-                 "(default: superb/wav2vec2-base-superb-sid)",
-        )
-        p.add_argument(
-            "--max-duration", type=float, default=3.0, metavar="SEC",
-            help="Maximum audio clip length in seconds; clips are truncated/padded. "
-                 "(default: 3.0)",
-        )
-        p.add_argument(
-            "--epochs", type=int, default=10, metavar="N",
-            help="Number of training epochs. (default: 10)",
-        )
-        p.add_argument(
-            "--batch", type=int, default=4, metavar="N",
-            help="Per-device train batch size. (default: 4)",
-        )
-        p.add_argument(
-            "--accum", type=int, default=4, metavar="N",
-            help="Gradient accumulation steps; effective batch = batch x accum. (default: 4)",
-        )
-        p.add_argument(
-            "--lr", type=float, default=3e-5, metavar="LR",
-            help="Learning rate. (default: 3e-5)",
-        )
-        p.add_argument(
-            "--fp16", action="store_true",
-            help="Enable mixed-precision training (requires NVIDIA GPU).",
-        )
-        p.add_argument(
-            "--save-steps", type=int, default=200, metavar="N",
-            help="Save a checkpoint every N steps. (default: 200)",
-        )
-        p.add_argument(
-            "--metadata-cache", default=None, metavar="PATH",
-            help=(
-                "Path to cache the Audio-cast dataset (speeds up reruns). "
-                "Omit to use default location inside --output. "
-                "Pass empty string '' to disable caching."
-            ),
-        )
-        p.add_argument(
-            "--seed", type=int, default=42, metavar="N",
-            help="Global random seed. (default: 42)",
-        )
-
-    # ---- eval-specific arguments ----
+        _add_train_args(p)
     for p in (p_eval, p_train_eval):
-        p.add_argument(
-            "--eval-model", default=None, metavar="PATH",
-            help="Path to the model to evaluate. Defaults to --output if not specified.",
-        )
-        
-        
-    # ---- mac shortcut ----
-    p_mac = sub.add_parser(
-        "mac",
-        help="Preset for Apple Silicon (MPS): soundfile backend, softmax eval, fp16 off.",
-    )
-    p_mac.add_argument("--dataset",  required=True, metavar="PATH",
-                       help="Root directory of audio files.")
-    p_mac.add_argument("--output",   default="exps/model", metavar="PATH",
-                       help="Output directory. (default: exps/model)")
-    p_mac.add_argument("--epochs",   type=int,   default=10,   metavar="N")
-    p_mac.add_argument("--batch",    type=int,   default=4,    metavar="N")
-    p_mac.add_argument("--accum",    type=int,   default=4,    metavar="N")
-    p_mac.add_argument("--lr",       type=float, default=3e-5, metavar="LR")
-    p_mac.add_argument("--max-duration", type=float, default=3.0, metavar="SEC")
-    p_mac.add_argument("--save-steps",   type=int,   default=200,  metavar="N")
-    p_mac.add_argument("--min-speaker-files", type=int, default=1, metavar="N")
-    p_mac.add_argument("--metadata-cache", default=None, metavar="PATH")
-    p_mac.add_argument("--seed",     type=int,   default=42,   metavar="N")
-    p_mac.add_argument("--eval-model", default=None, metavar="PATH",
-                       help="Model to eval after training. Defaults to --output.")
-    p_mac.add_argument("--resume",    action="store_true",  default=True)
-    p_mac.add_argument("--no-resume", dest="resume", action="store_false")
-    p_mac.add_argument( "--max-samples", type=int, default=None, metavar="N")
+        _add_eval_args(p)
 
-    # ---- windows shortcut ----
-    p_win = sub.add_parser(
-        "windows",
-        help="Preset for Windows/NVIDIA (CUDA): librosa backend, pipeline eval, fp16 on.",
-    )
-    p_win.add_argument("--dataset",  required=True, metavar="PATH",
-                       help="Root directory of audio files.")
-    p_win.add_argument("--output",   default="exps/model", metavar="PATH",
-                       help="Output directory. (default: exps/model)")
-    p_win.add_argument("--epochs",   type=int,   default=10,   metavar="N")
-    p_win.add_argument("--batch",    type=int,   default=4,    metavar="N")
-    p_win.add_argument("--accum",    type=int,   default=4,    metavar="N")
-    p_win.add_argument("--lr",       type=float, default=3e-5, metavar="LR")
-    p_win.add_argument("--max-duration", type=float, default=3.0, metavar="SEC")
-    p_win.add_argument("--save-steps",   type=int,   default=200,  metavar="N")
-    p_win.add_argument("--min-speaker-files", type=int, default=1, metavar="N")
-    p_win.add_argument("--metadata-cache", default=None, metavar="PATH")
-    p_win.add_argument("--seed",     type=int,   default=42,   metavar="N")
-    p_win.add_argument("--eval-model", default=None, metavar="PATH",
-                       help="Model to eval after training. Defaults to --output.")
-    p_win.add_argument("--resume",    action="store_true",  default=True)
-    p_win.add_argument("--no-resume", dest="resume", action="store_false")
-    p_win.add_argument( "--max-samples", type=int, default=None, metavar="N")
+    # ── mac shortcut ─────────────────────────────────────────────────────── #
+    p_mac = sub.add_parser("mac",
+        help="Preset for Apple Silicon: soundfile, softmax eval, fp16 off. Runs train+eval.")
+    _add_shared_args(p_mac)
+    _add_train_args(p_mac)
+    _add_eval_args(p_mac)
+
+    # ── windows shortcut ─────────────────────────────────────────────────── #
+    p_win = sub.add_parser("windows",
+        help="Preset for Windows/NVIDIA: librosa, pipeline eval, fp16 on. Runs train+eval.")
+    _add_shared_args(p_win)
+    _add_train_args(p_win)
+    _add_eval_args(p_win)
 
     return parser
 
