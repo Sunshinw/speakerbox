@@ -410,7 +410,8 @@ def train(
                                classification head already attached).
     """
     import transformers
-    from datasets import Audio, load_metric
+    from datasets import Audio
+    import evaluate  
     from transformers import (
         Trainer,
         TrainingArguments,
@@ -500,7 +501,7 @@ def train(
 
     # ── training arguments ────────────────────────────────────────────────── #
     args   = TrainingArguments(output_dir=model_name, **trainer_arguments_kws)
-    metric = load_metric("accuracy")
+    metric = evaluate.load("accuracy")
 
     def compute_metrics(eval_pred):
         logits = eval_pred.predictions
