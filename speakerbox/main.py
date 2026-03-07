@@ -411,7 +411,7 @@ def train(
     """
     import transformers
     from datasets import Audio
-    import evaluate  
+    from evaluate import load as load_metric  
     from transformers import (
         Trainer,
         TrainingArguments,
@@ -471,8 +471,6 @@ def train(
             label2id=label2id,
             id2label=id2label,
             ignore_mismatched_sizes=True,
-            output_hidden_states=False,
-            output_attentions=False,
         ).to(device)
 
     # ── audio metadata cache ──────────────────────────────────────────────── #
@@ -501,7 +499,7 @@ def train(
 
     # ── training arguments ────────────────────────────────────────────────── #
     args   = TrainingArguments(output_dir=model_name, **trainer_arguments_kws)
-    metric = evaluate.load("accuracy")
+    metric = load_metric("accuracy")
 
     def compute_metrics(eval_pred):
         logits = eval_pred.predictions
