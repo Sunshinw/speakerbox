@@ -56,6 +56,7 @@ class LazyAudioCollator:
             return librosa.load(path, sr=self.fe.sampling_rate)[0]
         else:
             import soundfile as sf
+            # print(f"\nLoading audio from: {path}\n")
             wav, _ = sf.read(path)
             return wav
 
@@ -293,7 +294,10 @@ def eval_model(
     os.makedirs(model_name, exist_ok=True)
     with open(f"{model_name}/results.md", "w") as f:
         f.write(EVAL_RESULTS_TEMPLATE.format(
-            accuracy=accuracy, precision=precision, recall=recall, loss=loss,
+            accuracy=accuracy*100, 
+            precision=precision*100, 
+            recall=recall*100, 
+            loss=loss,
         ))
     log.info(f"Eval results saved → {model_name}/results.md")
 
@@ -474,32 +478,49 @@ def train(
         ).to(device)
 
     # ── audio metadata cache ──────────────────────────────────────────────── #
+    # print(f"\ndata set: {dataset['train'][0]['audio']['path']}\n")
     if metadata_cache_path == "":
+        # print(f"\n1\n")
         log.info("Metadata caching disabled — casting on-the-fly.")
         dataset = dataset.cast_column(
             "audio", Audio(sampling_rate=feature_extractor.sampling_rate, decode=False)
         )
     else:
+        # print(f"\nmetdata: {metadata_cache_path}\n")
         cache = (
             Path(metadata_cache_path) if metadata_cache_path
             else Path(model_name) / f"{Path(model_name).name}_metadata_ds"
         )
+        # print(f"\ncache: {cache}\n")
         if cache.exists():
+            # print(f"\n1\n")
             log.info(f"Loading cached metadata from: {cache}")
             from datasets import load_from_disk
-            dataset = load_from_disk(str(cache))
+            # print(f"\ndata set: {dataset['train'][0]['audio']['path']}\n")
+            # dataset = load_from_disk(str(cache))
+            # print(f"\ndata set: {dataset['train'][0]['audio']['path']}\n")
         else:
+            # print(f"\n2\n")
             log.info("Casting audio paths (decode=False) and caching...")
+            # print(f"\ndata set: {dataset['train'][0]['audio']['path']}\n")
             dataset = dataset.cast_column(
                 "audio", Audio(sampling_rate=feature_extractor.sampling_rate, decode=False)
             )
             cache.parent.mkdir(parents=True, exist_ok=True)
+            # print(f"\ndata set: {dataset['train'][0]['audio']['path']}\n")
             dataset.save_to_disk(str(cache))
             log.info(f"Metadata cached → {cache}")
 
     # ── training arguments ────────────────────────────────────────────────── #
+    # print("Training Arguments:")
+    # for k, v in trainer_arguments_kws.items():
+    #     print(f"- {k}: {v}")
+    # print("before save_steps:", trainer_arguments_kws.get("save_steps"))
     args   = TrainingArguments(output_dir=model_name, **trainer_arguments_kws)
+    # print("after save_steps:", trainer_arguments_kws.get("save_steps"))
+
     metric = load_metric("accuracy")
+    # print(f"\ndata set: {dataset['train'][0]['audio']['path']}\n")
 
     def compute_metrics(eval_pred):
         logits = eval_pred.predictions
@@ -516,8 +537,10 @@ def train(
         audio_backend=audio_backend,
         eval_mode=eval_mode,
     )
-
+    # print(f"\ndata set: {dataset['train'][0]['audio']['path']}\n")
     # ── trainer ───────────────────────────────────────────────────────────── #
+    # print("before trainer save_steps:", trainer_arguments_kws.get("save_steps"))
+    # print(f"argument: {args}")
     trainer = Trainer(
         model=model,
         args=args,
@@ -526,10 +549,13 @@ def train(
         compute_metrics=compute_metrics,
         callbacks=[archive_callback],
     )
-
+    print("before checkpoint:", trainer_arguments_kws.get("save_steps"))
     transformers.logging.set_verbosity_info()
-    checkpoint = _find_last_checkpoint(model_name) if resume_from_checkpoint else None
-    trainer.train(resume_from_checkpoint=checkpoint)
+    if resume_from_checkpoint:
+        checkpoint = _find_last_checkpoint(model_name) 
+        trainer.train(resume_from_checkpoint=checkpoint)
+    else :
+        trainer.train(resume_from_checkpoint=None)
     trainer.save_model()
     feature_extractor.save_pretrained(model_name)
 

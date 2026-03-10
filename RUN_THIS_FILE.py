@@ -65,14 +65,14 @@ def prepare_dataset(root_path: str, min_speaker_files: int, seed: int, max_sampl
 
 def cmd_train(args) -> DatasetDict:
     dataset = prepare_dataset(args.dataset, args.min_speaker_files, args.seed, args.max_samples)
-
+    # print(dataset["train"][0])
     trainer_args = {
         "learning_rate":               args.lr,
         "num_train_epochs":            args.epochs,
         "per_device_train_batch_size": args.batch,
         "gradient_accumulation_steps": args.accum,
         "fp16":                        args.fp16,
-        "evaluation_strategy":         "no",
+        "eval_strategy":         "no",
         "save_strategy":               "steps",
         "save_steps":                  args.save_steps,
         "save_total_limit":            3,
@@ -80,6 +80,7 @@ def cmd_train(args) -> DatasetDict:
         "remove_unused_columns":       False,
         "logging_steps":               10,
         "report_to":                   "none",
+        "logging_strategy":              "epoch",
     }
 
     model_path = train(
@@ -156,7 +157,7 @@ def _add_train_args(p):
     p.add_argument("--accum",      type=int,   default=4,    metavar="N",  help="Grad accum steps; effective batch = batch x accum. (default: 4)")
     p.add_argument("--lr",         type=float, default=3e-5, metavar="LR", help="Learning rate. (default: 3e-5)")
     p.add_argument("--fp16",       action="store_true",                    help="Mixed-precision (NVIDIA only).")
-    p.add_argument("--save-steps", type=int,   default=200,  metavar="N",  help="Checkpoint every N steps. (default: 200)")
+    p.add_argument("--save-steps", type=int,   default=800,  metavar="N",  help="Checkpoint every N steps. (default: 800)")
     p.add_argument("--metadata-cache", default=None, metavar="PATH",
                    help="Audio-cast dataset cache path. None=auto, ''=disable.")
     p.add_argument("--seed", type=int, default=42, metavar="N", help="Random seed. (default: 42)")
