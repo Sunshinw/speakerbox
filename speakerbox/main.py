@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 EVAL_RESULTS_TEMPLATE = """
 ## Results
 
-* **Accuracy:** {accuracy}
+* **Validation Accuracy:** {accuracy}
 * **Precision:** {precision}
 * **Recall:** {recall}
 * **Validation Loss:** {loss}
